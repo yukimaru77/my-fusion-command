@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# claude-provider-commands wrapper
+# Keep the plain "claude" command on the official Claude Code executable while
+# adding the permission-skip flag by default.
+
+real="${CLAUDE_REAL_BIN:-}"
+versions_dir="$HOME/.local/share/claude/versions"
+
+if [ -z "$real" ] && [ -d "$versions_dir" ]; then
+  latest_name="$(
+    find "$versions_dir" -maxdepth 1 -type f -perm -111 -exec basename {} \; 2>/dev/null |
+      sort -t. -k1,1n -k2,2n -k3,3n |
+      tail -n 1
+  )"
+  if [ -n "$latest_name" ]; then
+    real="$versions_dir/$latest_name"
+  fi
+fi
+
+if [ -z "$real" ]; then
+  if [ -L "$HOME/.local/bin/claude-real" ] || [ -x "$HOME/.local/bin/claude-real" ]; then
+    real="$HOME/.local/bin/claude-real"
+  fi
+fi
+
+if [ -z "$real" ] || [ ! -x "$real" ]; then
+  echo "Claude Code executable not found" >&2
+  exit 69
+fi
+
+has_skip=0
+for arg in "$@"; do
+  if [ "$arg" = "--dangerously-skip-permissions" ]; then
+    has_skip=1
+    break
+  fi
+done
+
+if [ "$has_skip" = "1" ]; then
+  exec "$real" "$@"
+else
+  exec "$real" --dangerously-skip-permissions "$@"
+fi

@@ -1,0 +1,319 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [ "$#" -lt 1 ]; then
+  echo "usage: ccswitch-claude-run <codex|glm> [claude args...]" >&2
+  exit 64
+fi
+
+target="$1"
+shift
+
+home_dir="${HOME:?}"
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+db_path="$home_dir/.cc-switch/cc-switch.db"
+ccswitch_settings_path="$home_dir/.cc-switch/settings.json"
+claude_settings_path="$home_dir/.claude/settings.json"
+real_claude="${CCSWITCH_CLAUDE_BIN:-$script_dir/claude}"
+state_dir="$home_dir/.cc-switch/claude-wrapper-state"
+lock_dir="$state_dir/lock"
+cc_switch_bin="${CCSWITCH_BIN:-@CC_SWITCH_BIN@}"
+
+require_cmd() {
+  command -v "$1" >/dev/null 2>&1 || {
+    echo "missing required command: $1" >&2
+    exit 69
+  }
+}
+
+require_cmd jq
+require_cmd sqlite3
+
+if [ ! -x "$real_claude" ]; then
+  echo "Claude Code executable not found: $real_claude" >&2
+  exit 69
+fi
+
+if [ ! -f "$db_path" ]; then
+  echo "CC Switch DB not found: $db_path" >&2
+  exit 69
+fi
+
+mkdir -p "$state_dir" "$home_dir/.claude" "$home_dir/.cc-switch"
+
+find_cc_switch_bin() {
+  local candidate
+  for candidate in \
+    "$cc_switch_bin" \
+    "$home_dir/tasks/ccswitch-codex-glm/src-tauri/target/debug/cc-switch" \
+    "$home_dir/tasks/ccswitch-codex-glm/src-tauri/target/release/cc-switch" \
+    "$home_dir/tasks/cc-switch/src-tauri/target/debug/cc-switch" \
+    "$home_dir/tasks/cc-switch/src-tauri/target/release/cc-switch" \
+    "/Applications/CC Switch.app/Contents/MacOS/cc-switch"
+  do
+    if [ -n "$candidate" ] && [ -x "$candidate" ]; then
+      printf "%s\n" "$candidate"
+      return 0
+    fi
+  done
+
+  command -v cc-switch 2>/dev/null || true
+}
+
+acquire_lock() {
+  local waited=0
+  while ! mkdir "$lock_dir" 2>/dev/null; do
+    waited=$((waited + 1))
+    if [ "$waited" -gt 50 ]; then
+      echo "Timed out waiting for claude wrapper state lock. Removing stale lock." >&2
+      rm -rf "$lock_dir"
+      waited=0
+    fi
+    sleep 0.1
+  done
+}
+
+release_lock() {
+  rm -rf "$lock_dir"
+}
+
+sql_escape() {
+  printf "%s" "$1" | sed "s/'/''/g"
+}
+
+provider_settings() {
+  local provider_id="$1"
+  sqlite3 "$db_path" "SELECT settings_config FROM providers WHERE app_type='claude' AND id='$(sql_escape "$provider_id")' LIMIT 1;"
+}
+
+common_settings() {
+  sqlite3 "$db_path" "SELECT value FROM settings WHERE key='common_config_claude' LIMIT 1;"
+}
+
+restore_plain_claude_settings() {
+  local common default tmp
+  common="$(common_settings)"
+  [ -n "$common" ] || common='{}'
+  default="$(provider_settings default)"
+  [ -n "$default" ] || default='{"env":{}}'
+
+  tmp="$(mktemp)"
+  jq -n --argjson common "$common" --argjson provider "$default" '
+    ($common // {}) * ($provider // {})
+    | .env = ((($common // {}).env // {}) + (($provider // {}).env // {}))
+  ' > "$tmp"
+  mv "$tmp" "$claude_settings_path"
+}
+
+set_current_provider() {
+  local provider_id="$1"
+  sqlite3 "$db_path" <<SQL >/dev/null
+UPDATE providers
+SET is_current = CASE WHEN id='$(sql_escape "$provider_id")' THEN 1 ELSE 0 END
+WHERE app_type='claude';
+SQL
+
+  if [ -f "$ccswitch_settings_path" ]; then
+    local tmp
+    tmp="$(mktemp)"
+    jq --arg provider "$provider_id" '.currentProviderClaude=$provider' "$ccswitch_settings_path" > "$tmp"
+    mv "$tmp" "$ccswitch_settings_path"
+  fi
+}
+
+clear_takeover_state() {
+  sqlite3 "$db_path" <<SQL >/dev/null
+UPDATE proxy_config
+SET enabled=0,
+    live_takeover_active=0,
+    updated_at=datetime('now')
+WHERE app_type='claude';
+DELETE FROM proxy_live_backup WHERE app_type='claude';
+SQL
+}
+
+ensure_proxy_running() {
+  require_cmd lsof
+
+  if lsof -nP -iTCP:15721 -sTCP:LISTEN >/dev/null 2>&1; then
+    return 0
+  fi
+
+  local detected_bin
+  detected_bin="$(find_cc_switch_bin)"
+  if [ -z "$detected_bin" ] || [ ! -x "$detected_bin" ]; then
+    echo "CC Switch is not running and the cc-switch executable was not found." >&2
+    echo "Start CC Switch, or set CCSWITCH_BIN to the cc-switch executable path." >&2
+    exit 69
+  fi
+
+  sqlite3 "$db_path" <<SQL >/dev/null
+UPDATE proxy_config
+SET enabled=1,
+    proxy_enabled=1,
+    listen_address='127.0.0.1',
+    listen_port=15721,
+    updated_at=datetime('now')
+WHERE app_type='claude';
+SQL
+
+  nohup "$detected_bin" >/tmp/ccswitch-claude-codex.log 2>&1 &
+  for _ in $(seq 1 100); do
+    if lsof -nP -iTCP:15721 -sTCP:LISTEN >/dev/null 2>&1; then
+      break
+    fi
+    sleep 0.2
+  done
+
+  clear_takeover_state
+  restore_plain_claude_settings
+
+  if ! lsof -nP -iTCP:15721 -sTCP:LISTEN >/dev/null 2>&1; then
+    echo "CC Switch local proxy is not running on 127.0.0.1:15721" >&2
+    echo "Start CC Switch, or set CCSWITCH_BIN to the cc-switch executable path." >&2
+    exit 69
+  fi
+}
+
+has_model_arg=0
+has_skip_permissions_arg=0
+for arg in "$@"; do
+  case "$arg" in
+    --model|-m|--model=*)
+      has_model_arg=1
+      ;;
+    --dangerously-skip-permissions)
+      has_skip_permissions_arg=1
+      ;;
+  esac
+done
+
+skip_permissions_args=()
+if [ "$has_skip_permissions_arg" = "0" ]; then
+  skip_permissions_args=(--dangerously-skip-permissions)
+fi
+
+run_codex() {
+  local settings main_model haiku_model sonnet_model opus_model count
+  settings="$(provider_settings codex-oauth)"
+  if [ -z "$settings" ]; then
+    echo "CC Switch provider not found: codex-oauth" >&2
+    exit 69
+  fi
+
+  main_model="$(jq -r '.env.ANTHROPIC_MODEL // "gpt-5.5"' <<<"$settings")"
+  haiku_model="$(jq -r '.env.ANTHROPIC_DEFAULT_HAIKU_MODEL // .env.ANTHROPIC_MODEL // "gpt-5.4-mini"' <<<"$settings")"
+  sonnet_model="$(jq -r '.env.ANTHROPIC_DEFAULT_SONNET_MODEL // .env.ANTHROPIC_MODEL // "gpt-5.5"' <<<"$settings")"
+  opus_model="$(jq -r '.env.ANTHROPIC_DEFAULT_OPUS_MODEL // .env.ANTHROPIC_MODEL // "gpt-5.5"' <<<"$settings")"
+
+  ensure_proxy_running
+
+  CODEX_COUNT_FILE="$state_dir/codex-count"
+  acquire_lock
+  count="$(cat "$CODEX_COUNT_FILE" 2>/dev/null || echo 0)"
+  count=$((count + 1))
+  printf "%s\n" "$count" > "$CODEX_COUNT_FILE"
+  set_current_provider codex-oauth
+  clear_takeover_state
+  release_lock
+
+  cleanup_codex() {
+    local status=$? next_count
+    acquire_lock
+    next_count="$(cat "$CODEX_COUNT_FILE" 2>/dev/null || echo 1)"
+    next_count=$((next_count - 1))
+    if [ "$next_count" -le 0 ]; then
+      rm -f "$CODEX_COUNT_FILE"
+      set_current_provider default
+      clear_takeover_state
+      restore_plain_claude_settings
+    else
+      printf "%s\n" "$next_count" > "$CODEX_COUNT_FILE"
+    fi
+    release_lock
+    exit "$status"
+  }
+  trap cleanup_codex EXIT HUP INT TERM
+
+  if [ "$has_model_arg" = "0" ]; then
+    env \
+      -u ANTHROPIC_AUTH_TOKEN \
+      ANTHROPIC_BASE_URL="http://127.0.0.1:15721" \
+      ANTHROPIC_API_KEY="PROXY_MANAGED" \
+      ANTHROPIC_DEFAULT_HAIKU_MODEL="claude-haiku-4-5" \
+      ANTHROPIC_DEFAULT_HAIKU_MODEL_NAME="$haiku_model" \
+      ANTHROPIC_DEFAULT_SONNET_MODEL="claude-sonnet-4-6" \
+      ANTHROPIC_DEFAULT_SONNET_MODEL_NAME="$sonnet_model" \
+      ANTHROPIC_DEFAULT_OPUS_MODEL="claude-opus-4-8" \
+      ANTHROPIC_DEFAULT_OPUS_MODEL_NAME="$opus_model" \
+      "$real_claude" "${skip_permissions_args[@]}" --model opus "$@"
+  else
+    env \
+      -u ANTHROPIC_AUTH_TOKEN \
+      ANTHROPIC_BASE_URL="http://127.0.0.1:15721" \
+      ANTHROPIC_API_KEY="PROXY_MANAGED" \
+      ANTHROPIC_MODEL="$main_model" \
+      ANTHROPIC_DEFAULT_HAIKU_MODEL="claude-haiku-4-5" \
+      ANTHROPIC_DEFAULT_HAIKU_MODEL_NAME="$haiku_model" \
+      ANTHROPIC_DEFAULT_SONNET_MODEL="claude-sonnet-4-6" \
+      ANTHROPIC_DEFAULT_SONNET_MODEL_NAME="$sonnet_model" \
+      ANTHROPIC_DEFAULT_OPUS_MODEL="claude-opus-4-8" \
+      ANTHROPIC_DEFAULT_OPUS_MODEL_NAME="$opus_model" \
+      "$real_claude" "${skip_permissions_args[@]}" "$@"
+  fi
+}
+
+run_glm() {
+  local settings base_url token model
+  settings="$(provider_settings zai-glm)"
+  if [ -z "$settings" ]; then
+    echo "CC Switch provider not found: zai-glm" >&2
+    exit 69
+  fi
+
+  base_url="$(jq -r '.env.ANTHROPIC_BASE_URL // empty' <<<"$settings")"
+  token="$(jq -r '.env.ANTHROPIC_AUTH_TOKEN // empty' <<<"$settings")"
+  model="$(jq -r '.env.ANTHROPIC_MODEL // "glm-5.2"' <<<"$settings")"
+
+  if [ -z "$base_url" ] || [ -z "$token" ]; then
+    echo "Z.AI GLM provider is missing base URL or token in CC Switch DB." >&2
+    exit 69
+  fi
+
+  if [ "$has_model_arg" = "0" ]; then
+    env \
+      -u ANTHROPIC_API_KEY \
+      ANTHROPIC_BASE_URL="$base_url" \
+      ANTHROPIC_AUTH_TOKEN="$token" \
+      ANTHROPIC_MODEL="$model" \
+      ANTHROPIC_DEFAULT_HAIKU_MODEL="$model" \
+      ANTHROPIC_DEFAULT_SONNET_MODEL="$model" \
+      ANTHROPIC_DEFAULT_OPUS_MODEL="$model" \
+      API_TIMEOUT_MS="${API_TIMEOUT_MS:-3000000}" \
+      "$real_claude" "${skip_permissions_args[@]}" --model "$model" "$@"
+  else
+    env \
+      -u ANTHROPIC_API_KEY \
+      ANTHROPIC_BASE_URL="$base_url" \
+      ANTHROPIC_AUTH_TOKEN="$token" \
+      ANTHROPIC_MODEL="$model" \
+      ANTHROPIC_DEFAULT_HAIKU_MODEL="$model" \
+      ANTHROPIC_DEFAULT_SONNET_MODEL="$model" \
+      ANTHROPIC_DEFAULT_OPUS_MODEL="$model" \
+      API_TIMEOUT_MS="${API_TIMEOUT_MS:-3000000}" \
+      "$real_claude" "${skip_permissions_args[@]}" "$@"
+  fi
+}
+
+case "$target" in
+  codex)
+    run_codex "$@"
+    ;;
+  glm)
+    run_glm "$@"
+    ;;
+  *)
+    echo "unknown target: $target" >&2
+    exit 64
+    ;;
+esac
