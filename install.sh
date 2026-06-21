@@ -3,6 +3,8 @@ set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 bin_dir="${CCPC_BIN_DIR:-$HOME/.local/bin}"
+claude_dir="${CCPC_CLAUDE_DIR:-$HOME/.claude}"
+install_fusion="${CCPC_INSTALL_FUSION:-1}"
 
 mkdir -p "$bin_dir"
 
@@ -64,6 +66,53 @@ sed "s|@CC_SWITCH_BIN@|$escaped_bin|g" \
   "$repo_root/bin/ccswitch-claude-run.template" > "$bin_dir/ccswitch-claude-run"
 chmod 755 "$bin_dir/ccswitch-claude-run"
 
+if [ "$install_fusion" != "0" ]; then
+  mkdir -p "$claude_dir/hooks" "$claude_dir/commands"
+  install_mode_755 "$repo_root/fusion/hooks/collect-transcript.py" "$claude_dir/hooks/collect-transcript.py"
+  install_mode_755 "$repo_root/fusion/hooks/capture-query.py" "$claude_dir/hooks/capture-query.py"
+  install_mode_755 "$repo_root/fusion/hooks/fusion-run.py" "$claude_dir/hooks/fusion-run.py"
+  install -m 644 "$repo_root/fusion/commands/fusion.md" "$claude_dir/commands/fusion.md"
+
+  CLAUDE_FUSION_HOOK_PATH="$claude_dir/hooks/collect-transcript.py" python3 - "$claude_dir/settings.json" <<'PY'
+import json
+import os
+import sys
+from pathlib import Path
+path = Path(sys.argv[1])
+hook_path = os.environ["CLAUDE_FUSION_HOOK_PATH"]
+if path.exists():
+    data = json.loads(path.read_text())
+else:
+    data = {}
+hooks = data.setdefault("hooks", {})
+entries = [
+    ("SessionStart", 10),
+    ("UserPromptSubmit", 10),
+    ("PreToolUse", 10),
+    ("PostToolUse", 30),
+    ("PostToolUseFailure", 30),
+    ("Stop", 30),
+    ("SessionEnd", 30),
+    ("MessageDisplay", 10),
+]
+for event, timeout in entries:
+    arr = hooks.setdefault(event, [])
+    command = f"{hook_path} {event}"
+    exists = any(h.get("type") == "command" and h.get("command") == command for entry in arr for h in entry.get("hooks", []))
+    if not exists:
+        arr.append({
+            "hooks": [{
+                "type": "command",
+                "command": command,
+                "timeout": timeout,
+                "statusMessage": "Capturing Claude fusion event",
+            }]
+        })
+path.parent.mkdir(parents=True, exist_ok=True)
+path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n")
+PY
+fi
+
 cat <<EOF
 Installed Claude provider commands into:
   $bin_dir
@@ -72,6 +121,22 @@ Commands:
   claude
   claude-codex
   claude-glm
+EOF
+
+if [ "$install_fusion" != "0" ]; then
+  cat <<EOF
+
+Fusion command installed into:
+  $claude_dir
+
+Fusion usage:
+  /fusion <topic>
+
+If the current Claude Code session does not see /fusion or the hooks, restart Claude Code or open /hooks once.
+EOF
+fi
+
+cat <<EOF
 
 If your current shell cached an older command path, run:
   hash -r
