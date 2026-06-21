@@ -2,6 +2,22 @@
 
 Claude Code をコマンド名で使い分けるための小さな wrapper 集です。
 
+## 渡すもの
+
+人に渡す場合は、このリポジトリを丸ごと渡してください。
+
+```text
+claude-code-provider-commands/
+```
+
+AI agent に作業させる場合は、最初にこのファイルを読ませてください。
+
+```text
+docs/AI_INSTRUCTIONS.md
+```
+
+token は渡しません。Codex OAuth と GLM API token は、作業する人の CC Switch に登録されている前提です。
+
 ## できること
 
 このリポジトリは、次の3コマンドを作成します。
@@ -39,6 +55,20 @@ claude-glm    # CC Switch の GLM provider 経由
   - `zai-glm`: GLM 用
 
 provider ID が違う場合は、`bin/ccswitch-claude-run.template` 内の `codex-oauth` / `zai-glm` を変更してください。
+
+作業前チェック:
+
+```bash
+command -v claude
+command -v jq
+command -v sqlite3
+command -v lsof
+test -f ~/.cc-switch/cc-switch.db
+sqlite3 ~/.cc-switch/cc-switch.db \
+  "SELECT id, name FROM providers WHERE app_type='claude' AND id IN ('default','codex-oauth','zai-glm');"
+```
+
+3 provider が出ない場合は、先に CC Switch で provider を登録してください。
 
 ## インストール
 
@@ -122,3 +152,10 @@ default
 ## AI 向け手順
 
 AI agent に作業させる場合は [docs/AI_INSTRUCTIONS.md](docs/AI_INSTRUCTIONS.md) を渡してください。
+
+AI に渡すときの短い依頼文:
+
+```text
+この repo の docs/AI_INSTRUCTIONS.md に従って、claude / claude-codex / claude-glm コマンドをセットアップしてください。
+token は表示しないでください。作業後に README の確認コマンドを実行してください。
+```

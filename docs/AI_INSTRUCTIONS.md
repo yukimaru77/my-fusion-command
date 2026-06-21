@@ -1,5 +1,7 @@
 # AI Instructions
 
+You are setting up a small command-wrapper repo. Read this file first and follow it exactly.
+
 このリポジトリの目的は、Claude Code を3つのコマンドで使い分けられるようにすることです。
 
 ```bash
@@ -15,6 +17,36 @@ claude-glm    # GLM through CC Switch provider settings
 - 既存の `~/.local/bin/claude` は、必要なら `claude-real` または timestamp backup に退避する。
 - ユーザーの unrelated git changes は戻さない。
 - `~/.claude/settings.json` を恒久的に Codex/GLM へ書き換えない。
+- 確認コマンドで secret を表示しない。`settings_config` 全体をそのまま出力しない。
+
+## 最初に確認すること
+
+作業前に、次だけ確認する。
+
+```bash
+pwd
+command -v claude
+command -v jq
+command -v sqlite3
+command -v lsof
+test -f ~/.cc-switch/cc-switch.db
+sqlite3 ~/.cc-switch/cc-switch.db \
+  "SELECT id, name FROM providers WHERE app_type='claude' AND id IN ('default','codex-oauth','zai-glm');"
+```
+
+期待:
+
+- `claude`, `jq`, `sqlite3`, `lsof` が見つかる。
+- `~/.cc-switch/cc-switch.db` が存在する。
+- provider が3件出る。
+
+provider が不足している場合:
+
+- `default` がない: CC Switch の Claude provider 初期設定を作る。
+- `codex-oauth` がない: CC Switch で Codex OAuth provider を作る。
+- `zai-glm` がない: CC Switch で GLM provider を作る。
+
+provider ID が環境で違うだけなら、`bin/ccswitch-claude-run.template` の provider ID を変更する。
 
 ## 必要な前提
 
@@ -48,6 +80,12 @@ CCSWITCH_BIN="/path/to/cc-switch" ./install.sh
 
 ```bash
 CCPC_BIN_DIR="$HOME/.local/bin" ./install.sh
+```
+
+インストール後、現在の shell が古い command path を cache している場合があるので、必ず実行:
+
+```bash
+hash -r
 ```
 
 ## 検証手順
@@ -95,6 +133,40 @@ sqlite3 ~/.cc-switch/cc-switch.db \
 ```text
 default
 ```
+
+proxy 状態確認:
+
+```bash
+sqlite3 ~/.cc-switch/cc-switch.db \
+  "SELECT enabled, proxy_enabled, live_takeover_active, listen_address, listen_port FROM proxy_config WHERE app_type='claude';
+   SELECT COUNT(*) FROM proxy_live_backup WHERE app_type='claude';"
+```
+
+期待:
+
+```text
+0|1|0|127.0.0.1|15721
+0
+```
+
+## よくある詰まり
+
+`claude-codex` が proxy で失敗する:
+
+- CC Switch が起動しているか確認する。
+- `lsof -nP -iTCP:15721 -sTCP:LISTEN` で local proxy を確認する。
+- `CCSWITCH_BIN=/path/to/cc-switch ./install.sh` で binary path を明示する。
+
+`claude` が古い本体を拾う:
+
+- `type -a claude` で `~/.local/bin/claude` が先にあるか確認する。
+- `hash -r` を実行する。
+- `~/.local/share/claude/versions` に最新版があるか確認する。
+
+`claude-glm` が token 不足で失敗する:
+
+- token は表示しない。
+- CC Switch UI で `zai-glm` provider の Base URL, token, model を設定する。
 
 ## 実装の要点
 
