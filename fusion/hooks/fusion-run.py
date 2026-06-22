@@ -5,7 +5,22 @@ from pathlib import Path
 HOME = Path.home()
 CAPTURE_ROOT = HOME / ".claude" / "session-captures"
 ENABLE_FILE = CAPTURE_ROOT / "enabled"
-DEFAULT_AGENTS = [("claude", "claude"), ("codex", "claude-codex"), ("glm", "claude-glm")]
+FUSION_CONFIG = HOME / ".claude" / "fusion.json"
+BUILTIN_AGENTS = [("claude", "claude"), ("codex", "claude-codex"), ("glm", "claude-glm")]
+
+
+def load_agents_config():
+    if FUSION_CONFIG.exists():
+        try:
+            entries = json.loads(FUSION_CONFIG.read_text())
+            if isinstance(entries, list) and entries:
+                return [(e["name"], e["command"]) for e in entries]
+        except Exception:
+            pass
+    return BUILTIN_AGENTS
+
+
+DEFAULT_AGENTS = load_agents_config()
 
 
 def run(cmd, check=True):
@@ -66,10 +81,10 @@ def compact(text, limit):
 
 def judge_prompt(topic, run_id, rows):
     parts = [
-        "あなたは /fusion のmain judgeです。以下は同じお題に対する複数forkの回答とtool証跡です。",
-        "各案を批判的に、ただしリスペクトを持って評価し、良い部分は取り入れてください。",
-        "最後に、あなた自身も独立に考えたうえで、最終結論を日本語で出してください。",
-        "", f"お題: {topic}", f"run_id: {run_id}", "", "--- fork outputs ---"
+        "以下は同じプロンプトに対する複数の独立した回答です。",
+        "すべてに目を通し、よく考えたうえで、プロンプトに対する最高の回答を一つだけ日本語で出してください。",
+        "回答だけを出力してください。分析プロセスや各回答への言及は不要です。",
+        "", f"プロンプト: {topic}", f"run_id: {run_id}", "", "--- fork outputs ---"
     ]
     for sid, path, s in sorted(rows, key=lambda x: x[2].get("session_title") or ""):
         title = s.get("session_title") or sid
@@ -83,7 +98,7 @@ def judge_prompt(topic, run_id, rows):
             "### last_tool_stderr", compact(resp.get("stderr") or "", 600),
             "### final_answer", compact(s.get("last_assistant") or "", 5000), ""
         ]
-    parts += ["--- judge instructions ---", "1. 各forkの良い点を拾う。", "2. 各forkの弱点・見落としを指摘する。", "3. 共通点と相違点を整理する。", "4. 最後に自分自身の結論を出す。単なる多数決にはしない。"]
+    parts += []
     return "\n".join(parts)
 
 
@@ -118,7 +133,7 @@ def main():
         tmux("send-keys", "-t", f"{session}:{i}", command, "C-m")
         time.sleep(2)
     time.sleep(10)
-    member_prompt = "あなたは /fusion の並列検討メンバーです。必要ならBash toolを1回だけ使って作業ディレクトリ等を確認してください。その後、次のお題について、立場・理由・リスク/反論・最終提案を簡潔に述べてください。他メンバーの回答は見えない前提で独立に考えてください。\n\nお題: " + topic
+    member_prompt = "あなたは /fusion の並列検討メンバーです。必要ならBash toolを1回だけ使って作業ディレクトリ等を確認してください。その後、次のプロンプトについて、立場・理由・リスク/反論・最終提案を簡潔に述べてください。他メンバーの回答は見えない前提で独立に考えてください。\n\nプロンプト: " + topic
     for i in range(len(agents)):
         tmux("send-keys", "-t", f"{session}:{i}", member_prompt, "C-m")
         time.sleep(0.5)

@@ -10,4 +10,4 @@ Run the fusion harness for this topic:
 ~/.claude/hooks/fusion-run.py "$ARGUMENTS"
 ```
 
-After the command finishes, read the generated `JUDGE_PROMPT=...` file path from the output if needed, then act as the main judge: critically review each forked answer with respect, incorporate the strongest parts, add your own independent reasoning, and give the final conclusion in Japanese.
+After the command finishes, read the generated `JUDGE_PROMPT=...` file path from the output if needed, then read all fork answers, think deeply, and give the single best answer in Japanese. Output only the answer — no evaluation or analysis of the forks.
