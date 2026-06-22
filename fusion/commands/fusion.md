@@ -1,5 +1,5 @@
 ---
-description: 複数モデルに同じプロンプトを並列で投げ、統合された一つの回答を返す。設計判断・トレードオフ比較・レビュー・原因切り分けなど、複数の視点があると質が上がる問いに使う。事実確認や単純な実装作業には不向き。
+description: Send the same prompt to multiple models in parallel and return a single synthesized answer. Use for questions that benefit from multiple perspectives and deeper thinking — design decisions, tradeoff comparisons, reviews, root cause analysis. Not suited for factual lookups or simple implementation tasks.
 argument-hint: <prompt>
 allowed-tools: Bash, Read
 ---
