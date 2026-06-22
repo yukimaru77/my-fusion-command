@@ -1,6 +1,6 @@
 ---
-description: Run parallel forked Claude sessions, collect their outputs, and judge them in the main session
-argument-hint: <topic>
+description: 複数モデルに同じプロンプトを並列で投げ、統合された一つの回答を返す。設計判断・トレードオフ比較・レビュー・原因切り分けなど、複数の視点があると質が上がる問いに使う。事実確認や単純な実装作業には不向き。
+argument-hint: <prompt>
 allowed-tools: Bash, Read
 ---
 
