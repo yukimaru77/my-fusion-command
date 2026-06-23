@@ -56,8 +56,8 @@ Claude Code 用の `/fusion` スラッシュコマンドです。
 - Claude Code
 - `tmux`, `python3`, `jq`, `sqlite3`, `lsof`
 - `~/.local/bin` が `PATH` に入っていること
-- エージェントのコマンド（`claude-codex` 等）が使える状態であること
-  - CC Switch でのプロバイダー切り替えについては `bin/` 内のスクリプトを参照
+- **[ccswitch-claude-codex-setup](https://github.com/yukimaru77/ccswitch-claude-codex-setup)** を先にセットアップしてください
+  - `claude-codex` / `claude-glm` 等のマルチプロバイダーコマンドはこのリポジトリで構築します
 
 ## インストール
 
