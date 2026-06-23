@@ -107,7 +107,7 @@ def main():
     p.add_argument("topic", nargs="*")
     p.add_argument("--n", type=int)
     p.add_argument("--agents")
-    p.add_argument("--base-session", default=os.environ.get("CLAUDE_FUSION_BASE_SESSION"), help="Session id to resume. If omitted, uses --continue.")
+    p.add_argument("--base-session", default=os.environ.get("CLAUDE_FUSION_BASE_SESSION", os.environ.get("CLAUDE_CODE_SESSION_ID", "")), help="Session id to resume. If omitted, uses --continue.")
     p.add_argument("--workdir", default=os.getcwd())
     p.add_argument("--timeout", type=int, default=240)
     args = p.parse_args()

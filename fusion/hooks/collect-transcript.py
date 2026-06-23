@@ -84,8 +84,8 @@ def summarize_hooks(events_path, dst_summary):
             except Exception:
                 continue
             summary["events"] += 1
-            name = event.get("event")
             payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+            name = event.get("event") if event.get("event") != "unknown" else payload.get("hook_event_name", "unknown")
             summary["session_id"] = payload.get("session_id") or event.get("session_id") or summary["session_id"]
             summary["session_title"] = payload.get("session_title") or summary["session_title"]
             summary["cwd"] = payload.get("cwd") or event.get("cwd") or summary["cwd"]
@@ -156,8 +156,8 @@ def main():
     if not capture_enabled():
         print(json.dumps({"suppressOutput": True}, ensure_ascii=False))
         return
-    event = os.environ.get("CLAUDE_HOOK_EVENT") or (sys.argv[1] if len(sys.argv) > 1 else "unknown")
     payload, raw = read_stdin_json()
+    event = os.environ.get("CLAUDE_HOOK_EVENT") or payload.get("hook_event_name") or (sys.argv[1] if len(sys.argv) > 1 else "unknown")
     session_id = payload.get("session_id") or payload.get("sessionId")
     cwd = payload.get("cwd") or payload.get("workspace_dir")
     transcript_path = payload.get("transcript_path")
