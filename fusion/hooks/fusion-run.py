@@ -6,6 +6,7 @@ import re
 import shlex
 import subprocess
 import time
+import uuid
 from pathlib import Path
 
 HOME = Path.home()
@@ -67,7 +68,7 @@ def cleanup_tmux_session(session_name, keep_session, capture_complete):
 
 
 def unique_run_id():
-    return time.strftime("%Y%m%d-%H%M%S")
+    return f"{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:8]}"
 
 
 def parse_agents(value):
@@ -475,7 +476,12 @@ def find_new_transcript(root, sid):
     return matches[0] if len(matches) == 1 else None
 
 
-def fork_launch_args(base_session, workdir, rollback_to_previous_turn, rollback_prompt=""):
+def new_session_launch_args():
+    new_sid = str(uuid.uuid4())
+    return new_sid, ["--session-id", new_sid]
+
+
+def fork_launch_args(base_session, workdir, rollback_to_previous_turn, rollback_prompt="", fork_title="fusion fork"):
     source = resolve_claude_session(base_session, workdir)
     sid = source.stem
     checkpoint_uuid = ""
@@ -486,7 +492,7 @@ def fork_launch_args(base_session, workdir, rollback_to_previous_turn, rollback_
         checkpoint = target_checkpoint_before_fusion(source_rows, by_uuid, chain, sid, rollback_prompt)
         checkpoint_uuid = checkpoint["uuid"]
     result = subprocess.run(
-        [SDK_FORK_BIN, sid, workdir, checkpoint_uuid, "fusion fork"],
+        [SDK_FORK_BIN, sid, workdir, checkpoint_uuid, fork_title],
         cwd=workdir,
         stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
@@ -970,8 +976,11 @@ def main():
                 args.workdir,
                 rollback_forks,
                 invocation_info.get("latest_prompt", ""),
+                title,
             )
-            fork_session_ids[label] = resume_session
+        else:
+            resume_session, fork_args = new_session_launch_args()
+        fork_session_ids[label] = resume_session
         command_parts = [
             "CLAUDE_TRANSCRIPT_CAPTURE=1",
             cmd,

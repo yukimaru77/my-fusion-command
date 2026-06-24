@@ -191,7 +191,7 @@ sqlite3 ~/.cc-switch/cc-switch.db \
 - `/fusion` は `fusion-sdk-fork.mjs` 経由で `forkSession` を呼び、必要なら `upToMessageId` を渡して元セッションを切り詰めた新セッションを作る。
 - `/fusion` は `tmux` 上で `claude` / `claude-codex` / `claude-glm` を `--resume <fork-session-id>` で起動する。TUI 側の `--fork-session` / `--resume-session-at` には依存しない。
 - `/fusion` の収集 timeout はデフォルト120分。`fusion/commands/fusion.md` 側でも Bash tool timeout を120分以上に指定し、`fusion-run.py --timeout 7200` を呼ぶ。
-- 全エージェントの回答回収が完了した run は、client が attach 中でも tmux session を即時削除する。回答を取りこぼした run は調査用に tmux session を残す。
+- 全エージェントの回答回収が完了した run は tmux session を即時削除する。回答を取りこぼした run は調査用に tmux session を残すが、run id と child session id は毎回新規生成し、残った tmux session を次回の `/fusion` で再利用しない。
 - 子 fork は `--disable-slash-commands` と `--append-system-prompt` 付きで起動する。direct `/fusion` では `/fusion` 自体が履歴に残らない状態で prompt だけを送る。
 - fork の対応付けは prompt 内タグではなく `--name fusion-<agent>-<run_id>` と hook payload の `session_title` で行う。
 - `~/.claude/projects/**/*.jsonl` は回答収集の fallback と rollback 検証に使う。hook capture が不完全な場合でも fork session id から JSONL を読んで最後の assistant answer を回収する。

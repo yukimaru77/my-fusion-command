@@ -111,7 +111,7 @@ Claude Code のセッション内で:
 /fusion 設計についてどう思う？
 ```
 
-実行中は tmux セッション `fusion-<run_id>` が作られます。デフォルトでは `claude` / `codex` / `glm` が tmux window として並びます。全エージェントの回答を回収できた場合、attach 中かどうかに関係なく tmux セッションは自動削除されます。回答を取りこぼした場合だけ、調査用に tmux セッションを残します。
+実行中は tmux セッション `fusion-<run_id>` が作られます。デフォルトでは `claude` / `codex` / `glm` が tmux window として並びます。全エージェントの回答を回収できた場合、tmux セッションは自動削除されます。回答を取りこぼした場合だけ、調査用に tmux セッションを残します。各 run と child session id は毎回新しく生成されるため、残った tmux セッションが次回の `/fusion` に再利用されることはありません。
 
 `/fusion` の収集 timeout はデフォルト120分です。長いコードレビューや全ファイル精査でも途中回答を拾って終わらないよう、slash command 側も Bash tool timeout を120分に設定します。
 
