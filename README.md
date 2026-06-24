@@ -111,7 +111,7 @@ Claude Code のセッション内で:
 /fusion 設計についてどう思う？
 ```
 
-実行中は tmux セッション `fusion-<run_id>` が作られます。デフォルトでは `claude` / `codex` / `glm` が tmux window として並びます。
+実行中は tmux セッション `fusion-<run_id>` が作られます。デフォルトでは `claude` / `codex` / `glm` が tmux window として並びます。slash command からの実行では `--keep-session` を付けるため、回答回収後も tmux セッションは残ります。
 
 `/fusion` の収集 timeout はデフォルト120分です。長いコードレビューや全ファイル精査でも途中回答を拾って終わらないよう、slash command 側も Bash tool timeout を120分に設定します。
 
@@ -122,6 +122,12 @@ Ctrl-b 0    claude
 Ctrl-b 1    codex
 Ctrl-b 2    glm
 Ctrl-b w    window 一覧
+```
+
+見終わった tmux セッションは手動で閉じます。
+
+```bash
+tmux kill-session -t fusion-<run_id>
 ```
 
 ## 動作確認
