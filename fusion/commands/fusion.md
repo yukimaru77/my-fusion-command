@@ -9,7 +9,7 @@ Set the Bash tool timeout to at least 7200000 ms. Do not use Agent, Task, backgr
 If the Bash call times out or fails, report that failure and do not synthesize an answer from any other mechanism.
 
 ```bash
-~/.claude/hooks/fusion-run.py --timeout 7200 --keep-session "$ARGUMENTS"
+~/.claude/hooks/fusion-run.py --timeout 7200 "$ARGUMENTS"
 ```
 
 After the command finishes, read the generated `JUDGE_PROMPT=...` file path from the output if needed, then read all fork answers, think deeply, and give the single best answer in Japanese. Output only the answer — no evaluation or analysis of the forks.

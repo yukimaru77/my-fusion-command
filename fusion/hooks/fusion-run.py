@@ -57,6 +57,41 @@ def cmux(*args, check=True):
     return run(["cmux", *args], check=check)
 
 
+def tmux_session_has_clients(session_name):
+    result = tmux("list-clients", "-t", session_name, "-F", "#{client_tty}", check=False)
+    return result.returncode == 0 and bool(result.stdout.strip())
+
+
+def defer_tmux_cleanup_until_detached(session_name):
+    script = """
+session="$1"
+while tmux has-session -t "$session" 2>/dev/null; do
+  if ! tmux list-clients -t "$session" -F '#{client_tty}' 2>/dev/null | grep -q .; then
+    tmux kill-session -t "$session" 2>/dev/null || true
+    exit 0
+  fi
+  sleep 5
+done
+"""
+    subprocess.Popen(
+        ["sh", "-c", script, "fusion-cleanup", session_name],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+
+
+def cleanup_tmux_session(session_name, keep_session):
+    if keep_session:
+        return False, False
+    if tmux_session_has_clients(session_name):
+        defer_tmux_cleanup_until_detached(session_name)
+        return False, True
+    tmux("kill-session", "-t", session_name, check=False)
+    return True, False
+
+
 def unique_run_id():
     return time.strftime("%Y%m%d-%H%M%S")
 
@@ -972,12 +1007,13 @@ def main():
 
     judge_prompt = build_judge_prompt(topic, run_id, rows)
     (result_dir / "judge-prompt.md").write_text(judge_prompt, encoding="utf-8")
-    cleaned_tmux_session = not args.keep_session
+    cleaned_tmux_session, cleanup_deferred = cleanup_tmux_session(session_name, args.keep_session)
 
     (result_dir / "manifest.json").write_text(json.dumps({
         "run_id": run_id,
         "tmux_session": session_name,
         "tmux_session_cleaned": cleaned_tmux_session,
+        "tmux_session_cleanup_deferred": cleanup_deferred,
         "topic": topic,
         "expected_titles": sorted(expected),
         "captured_titles": sorted(completed),
@@ -993,15 +1029,14 @@ def main():
         "judge_prompt": str(result_dir / "judge-prompt.md"),
     }, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
-    if cleaned_tmux_session:
-        tmux("kill-session", "-t", session_name, check=False)
-
     print(f"FUSION_RUN_ID={run_id}")
     print(f"TMUX_SESSION={session_name}")
     if cmux_monitor_surface:
         print(f"CMUX_MONITOR_SURFACE={cmux_monitor_surface}")
     if cleaned_tmux_session:
         print("TMUX_SESSION_CLEANED=1")
+    if cleanup_deferred:
+        print("TMUX_SESSION_CLEANUP_DEFERRED=1")
     print(f"FORK_MODE={fork_mode}")
     print(f"CAPTURED={len(completed)}/{len(expected)}")
     if missing:
