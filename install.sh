@@ -72,6 +72,7 @@ if [ "$install_fusion" != "0" ]; then
   install_mode_755 "$repo_root/fusion/hooks/capture-query.py" "$claude_dir/hooks/capture-query.py"
   install_mode_755 "$repo_root/fusion/hooks/fusion-run.py" "$claude_dir/hooks/fusion-run.py"
   install_mode_755 "$repo_root/fusion/hooks/fusion-sdk-fork.mjs" "$claude_dir/hooks/fusion-sdk-fork.mjs"
+  install_mode_755 "$repo_root/fusion/hooks/fusion-sdk-delete.mjs" "$claude_dir/hooks/fusion-sdk-delete.mjs"
   install -m 644 "$repo_root/fusion/commands/fusion.md" "$claude_dir/commands/fusion.md"
   install -m 644 "$repo_root/fusion/fusion-sdk/package.json" "$claude_dir/fusion-sdk/package.json"
 

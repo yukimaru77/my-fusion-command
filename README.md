@@ -44,6 +44,14 @@ skill や親エージェント経由で `/fusion` が呼ばれた場合は rollb
 
 子 fork では一時的な `CLAUDE_CONFIG_DIR` を使い、`/fusion` command と fusion 系 skill だけを除外します。他の skills / commands は残すため、fusion の再帰起動だけを止めつつ通常の調査能力は維持します。
 
+各子 fork の Claude session 履歴は、回答を回収したあと Claude Agent SDK の `deleteSession()` で自動削除します。`~/.claude/projects/**/*.jsonl` や `~/.claude/tasks/<session-id>` に fusion の子セッションが増え続けないようにするためです。デバッグで履歴を残したい場合だけ、直接実行時に `--keep-child-sessions` を指定してください。
+
+過去runの子セッションを後から消す場合:
+
+```bash
+~/.claude/hooks/fusion-run.py --cleanup-sessions <run-id>
+```
+
 ## エージェントのカスタマイズ
 
 デフォルトでは `claude` / `claude-codex` / `claude-glm` の3つが使われます。
@@ -136,6 +144,7 @@ Claude Code のセッション内で:
 - run id / result directory / prompt
 - direct `/fusion` rollback が実行されたか
 - 子 fork で無効化された fusion command / skill
+- 子 fork の session 履歴を削除したか
 - child session id
 - 各agentの running / complete / failed 状態、pid、duration
 - summary / stdout / stderr / judge prompt のファイルパス
@@ -151,12 +160,14 @@ type claude claude-codex claude-glm
 # /fusion 関連ファイル
 test -x ~/.claude/hooks/fusion-run.py && echo ok
 test -x ~/.claude/hooks/fusion-sdk-fork.mjs && echo ok
+test -x ~/.claude/hooks/fusion-sdk-delete.mjs && echo ok
 test -f ~/.claude/commands/fusion.md && echo ok
 test -d ~/.claude/fusion-sdk/node_modules/@anthropic-ai/claude-agent-sdk && echo ok
 
 # 構文チェック
 python3 -m py_compile ~/.claude/hooks/fusion-run.py
 node ~/.claude/hooks/fusion-sdk-fork.mjs || test $? -eq 2
+node ~/.claude/hooks/fusion-sdk-delete.mjs || test $? -eq 2
 
 # 最新runの状態確認
 ~/.claude/hooks/fusion-run.py --status

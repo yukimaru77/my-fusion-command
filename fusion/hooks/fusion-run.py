@@ -19,6 +19,7 @@ FUSION_CONFIG = HOME / ".claude" / "fusion.json"
 HISTORY_FILE = HOME / ".claude" / "history.jsonl"
 WORKDIR_DEFAULT = os.environ.get("PWD", str(Path.cwd()))
 SDK_FORK_BIN = os.environ.get("CLAUDE_FUSION_SDK_FORK_BIN", str(Path(__file__).resolve().parent / "fusion-sdk-fork.mjs"))
+SDK_DELETE_BIN = os.environ.get("CLAUDE_FUSION_SDK_DELETE_BIN", str(Path(__file__).resolve().parent / "fusion-sdk-delete.mjs"))
 
 BUILTIN_AGENTS = [
     ("claude", "claude"),
@@ -252,6 +253,65 @@ def prepare_child_claude_config(result_dir):
         "excluded_commands": excluded_commands,
         "excluded_skills": excluded_skills,
     }
+
+
+def unique_values(values):
+    seen = set()
+    result = []
+    for value in values:
+        if not isinstance(value, str) or not value or value in seen:
+            continue
+        seen.add(value)
+        result.append(value)
+    return result
+
+
+def cleanup_child_session(config_root, session_id):
+    root = Path(config_root)
+    deleted = []
+    missing = []
+    errors = []
+
+    sdk_result = run([SDK_DELETE_BIN, session_id, str(root)], check=False)
+    if sdk_result.returncode == 0:
+        try:
+            payload = json.loads(sdk_result.stdout)
+        except json.JSONDecodeError:
+            payload = {}
+        deleted.append(f"sdk:deleteSession:{payload.get('sessionId') or session_id}")
+    else:
+        detail = (sdk_result.stderr or sdk_result.stdout or "").strip() or f"exit status {sdk_result.returncode}"
+        errors.append({"path": f"sdk:deleteSession:{session_id}", "error": detail})
+
+    tasks = root / "tasks" / session_id
+    try:
+        if tasks.is_symlink() or tasks.is_file():
+            tasks.unlink()
+            deleted.append(str(tasks))
+        elif tasks.is_dir():
+            shutil.rmtree(tasks)
+            deleted.append(str(tasks))
+        else:
+            missing.append(str(tasks))
+    except Exception as exc:
+        errors.append({"path": str(tasks), "error": str(exc)})
+
+    remaining_projects = []
+    projects = root / "projects"
+    if projects.is_dir():
+        remaining_projects = [str(path) for path in projects.glob(f"*/{session_id}.jsonl")]
+
+    return {
+        "session_id": session_id,
+        "deleted_paths": deleted,
+        "missing_paths": missing,
+        "errors": errors,
+        "remaining_project_paths": remaining_projects,
+    }
+
+
+def cleanup_child_sessions(config_root, session_ids):
+    return [cleanup_child_session(config_root, sid) for sid in unique_values(session_ids)]
 
 
 def resolve_claude_session(spec, workdir):
@@ -873,6 +933,7 @@ def manifest_payload(
     agent_jobs=None,
     started_at="",
     child_config_info=None,
+    child_session_cleanup=None,
 ):
     expected = {f"fusion-{label}-{run_id}" for label, _ in agents}
     completed = completed_titles(rows)
@@ -925,6 +986,7 @@ def manifest_payload(
         "history_latest_prompt": compact(invocation_info.get("history_prompt", ""), 1200),
         "fork_session_ids": dict(fork_session_ids),
         "retried_labels": list(retried_labels),
+        "child_session_cleanup": child_session_cleanup or {},
         "agent_results": agent_results,
         "judge_prompt": str(result_dir / "judge-prompt.md"),
     }
@@ -1095,6 +1157,30 @@ def format_status_text(run_dir, manifest, summaries, running):
         lines.append(f"child_config_dir: {child_config.get('child_config_dir') or '-'}")
         lines.append(f"disabled_commands: {', '.join(child_config.get('excluded_commands') or []) or '-'}")
         lines.append(f"disabled_skills: {', '.join(child_config.get('excluded_skills') or []) or '-'}")
+    cleanup = manifest.get("child_session_cleanup") or {}
+    if cleanup:
+        session_ids = cleanup.get("session_ids") or []
+        cleanup_results = cleanup.get("results") or []
+        result_session_ids = {item.get("session_id") for item in cleanup_results if isinstance(item, dict)}
+        cleanup_errors = sum(len(item.get("errors") or []) for item in cleanup_results)
+        remaining_paths = sum(len(item.get("remaining_project_paths") or []) for item in cleanup_results)
+        cleanup_complete = (
+            bool(cleanup.get("enabled"))
+            and bool(session_ids)
+            and set(session_ids) <= result_session_ids
+            and cleanup_errors == 0
+            and remaining_paths == 0
+        )
+        lines.append(f"child_session_cleanup_enabled: {bool(cleanup.get('enabled'))}")
+        lines.append(f"child_sessions_deleted: {cleanup_complete}")
+        if cleanup.get("kept_reason"):
+            lines.append(f"child_sessions_kept_reason: {cleanup.get('kept_reason')}")
+        if cleanup.get("session_ids"):
+            lines.append(f"child_session_ids: {', '.join(cleanup.get('session_ids') or [])}")
+        deleted_count = sum(len(item.get("deleted_paths") or []) for item in cleanup.get("results") or [])
+        lines.append(f"child_session_deleted_paths: {deleted_count}")
+        if cleanup_errors:
+            lines.append(f"child_session_delete_errors: {cleanup_errors}")
     if manifest.get("judge_prompt"):
         lines.append(f"judge_prompt: {manifest.get('judge_prompt')}")
 
@@ -1186,6 +1272,52 @@ def show_status(spec, output_json=False):
     return 0
 
 
+def manifest_child_session_ids(manifest):
+    ids = []
+    cleanup = manifest.get("child_session_cleanup") or {}
+    ids.extend(cleanup.get("session_ids") or [])
+    ids.extend((manifest.get("fork_session_ids") or {}).values())
+    for item in manifest.get("agent_results") or []:
+        if isinstance(item, dict):
+            ids.append(item.get("session_id") or "")
+    return unique_values(ids)
+
+
+def cleanup_run_sessions(spec, output_json=False):
+    run_dir = resolve_run_dir(spec)
+    manifest_path = Path(run_dir) / "manifest.json"
+    manifest = read_json_file(manifest_path)
+    if not manifest:
+        raise RuntimeError(f"manifest not found: {manifest_path}")
+
+    session_ids = manifest_child_session_ids(manifest)
+    config_root = ((manifest.get("child_config") or {}).get("source_config_dir") or str(claude_config_root()))
+    cleanup = {
+        "enabled": True,
+        "manual": True,
+        "manual_at": now_iso(),
+        "source_config_dir": config_root,
+        "session_ids": session_ids,
+        "results": cleanup_child_sessions(config_root, session_ids),
+        "kept_reason": "",
+    }
+    manifest["child_session_cleanup"] = cleanup
+    manifest["updated_at"] = now_iso()
+    write_json_file(manifest_path, manifest)
+
+    if output_json:
+        print(json.dumps(cleanup, ensure_ascii=False, indent=2))
+    else:
+        deleted_count = sum(len(item.get("deleted_paths") or []) for item in cleanup["results"])
+        error_count = sum(len(item.get("errors") or []) for item in cleanup["results"])
+        print(f"RUN_DIR={run_dir}")
+        print(f"CHILD_SESSION_IDS={','.join(session_ids) if session_ids else '-'}")
+        print(f"DELETED_PATHS={deleted_count}")
+        if error_count:
+            print(f"ERRORS={error_count}")
+    return 0
+
+
 def assistant_text(row):
     message = row.get("message")
     if not isinstance(message, dict):
@@ -1272,11 +1404,15 @@ def main():
     )
     parser.add_argument("--workdir", default=WORKDIR_DEFAULT)
     parser.add_argument("--timeout", type=int, default=7200)
+    parser.add_argument("--keep-child-sessions", action="store_true", help="Keep forked Claude child sessions in ~/.claude/projects for debugging")
     parser.add_argument("--status", nargs="?", const="latest", help="Show the latest or specified fusion run status and exit")
+    parser.add_argument("--cleanup-sessions", nargs="?", const="latest", help="Delete child Claude sessions for the latest or specified fusion run and exit")
     parser.add_argument("--json", action="store_true", help="With --status, output machine-readable JSON")
     args = parser.parse_args()
     if args.status is not None:
         return show_status(args.status, args.json)
+    if args.cleanup_sessions is not None:
+        return cleanup_run_sessions(args.cleanup_sessions, args.json)
 
     topic = " ".join(args.topic).strip()
     if not topic:
@@ -1331,9 +1467,16 @@ def main():
     system_prompt = build_child_system_prompt(rollback_forks)
 
     fork_session_ids = {}
+    child_session_ids = []
     agent_jobs = []
     agent_commands = {}
     retried_labels = []
+    child_session_cleanup = {
+        "enabled": not args.keep_child_sessions,
+        "session_ids": [],
+        "results": [],
+        "kept_reason": "requested by --keep-child-sessions" if args.keep_child_sessions else "",
+    }
 
     def update_manifest(status, rows):
         write_json_file(manifest_path, manifest_payload(
@@ -1352,6 +1495,7 @@ def main():
             agent_jobs=agent_jobs,
             started_at=started_at,
             child_config_info=child_config_info,
+            child_session_cleanup=child_session_cleanup,
         ))
 
     update_manifest("forking", [])
@@ -1370,6 +1514,8 @@ def main():
         else:
             resume_session, fork_args = new_session_launch_args()
         fork_session_ids[label] = resume_session
+        child_session_ids.append(resume_session)
+        child_session_cleanup["session_ids"] = unique_values(child_session_ids)
         agent_commands[label] = cmd
         agent_jobs.append(
             make_headless_job(
@@ -1410,6 +1556,8 @@ def main():
         else:
             retry_session, retry_args = new_session_launch_args()
         fork_session_ids[label] = retry_session
+        child_session_ids.append(retry_session)
+        child_session_cleanup["session_ids"] = unique_values(child_session_ids)
         retried_labels.append(label)
         update_manifest(f"retrying-{label}", list(by_title.values()))
         retry_job = make_headless_job(
@@ -1438,6 +1586,20 @@ def main():
 
     judge_prompt = build_judge_prompt(topic, run_id, rows)
     (result_dir / "judge-prompt.md").write_text(judge_prompt, encoding="utf-8")
+
+    for sid, _path, summary in rows:
+        child_session_ids.append(sid)
+        child_session_ids.append(summary.get("session_id") or "")
+    child_session_cleanup["session_ids"] = unique_values(child_session_ids)
+    if args.keep_child_sessions:
+        child_session_cleanup["enabled"] = False
+        child_session_cleanup["kept_reason"] = "requested by --keep-child-sessions"
+    else:
+        child_session_cleanup["enabled"] = True
+        child_session_cleanup["results"] = cleanup_child_sessions(
+            child_config_info["source_config_dir"],
+            child_session_cleanup["session_ids"],
+        )
 
     update_manifest("complete" if capture_complete else "incomplete", rows)
 
