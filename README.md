@@ -42,6 +42,8 @@ Claude Code 用の `/fusion` スラッシュコマンドです。
 
 skill や親エージェント経由で `/fusion` が呼ばれた場合は rollback しません。その代わり、子 fork には「あなたはすでに fusion エージェントの一員なので、再fusionせず自分で直接回答する」system prompt を追加します。
 
+子 fork では一時的な `CLAUDE_CONFIG_DIR` を使い、`/fusion` command と fusion 系 skill だけを除外します。他の skills / commands は残すため、fusion の再帰起動だけを止めつつ通常の調査能力は維持します。
+
 ## エージェントのカスタマイズ
 
 デフォルトでは `claude` / `claude-codex` / `claude-glm` の3つが使われます。
@@ -133,6 +135,7 @@ Claude Code のセッション内で:
 
 - run id / result directory / prompt
 - direct `/fusion` rollback が実行されたか
+- 子 fork で無効化された fusion command / skill
 - child session id
 - 各agentの running / complete / failed 状態、pid、duration
 - summary / stdout / stderr / judge prompt のファイルパス

@@ -5,6 +5,7 @@ import os
 import re
 import signal
 import shlex
+import shutil
 import subprocess
 import time
 import uuid
@@ -144,6 +145,113 @@ def read_jsonl(path):
 def claude_config_root():
     raw = os.environ.get("CLAUDE_CONFIG_DIR")
     return Path(raw).expanduser().resolve() if raw else (HOME / ".claude").resolve()
+
+
+def path_has_fusion_part(path):
+    return any("fusion" in part.lower() for part in Path(path).parts)
+
+
+def file_mentions_fusion(path, limit=12000):
+    try:
+        text = Path(path).read_text(encoding="utf-8", errors="replace")[:limit].lower()
+    except Exception:
+        return False
+    return any(token in text for token in ("/fusion", "fusion-run.py", "fusion command", "fusionエージェント"))
+
+
+def link_path(src, dst):
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        dst.symlink_to(src, target_is_directory=src.is_dir())
+    except OSError:
+        if src.is_dir():
+            shutil.copytree(src, dst, symlinks=True)
+        else:
+            shutil.copy2(src, dst)
+
+
+def mirror_commands_without_fusion(src, dst):
+    excluded = []
+    if not src.is_dir():
+        return excluded
+    for child in sorted(src.rglob("*")):
+        rel = child.relative_to(src)
+        target = dst / rel
+        if child.is_dir():
+            if path_has_fusion_part(rel):
+                excluded.append(str(rel))
+                continue
+            target.mkdir(parents=True, exist_ok=True)
+            continue
+        if path_has_fusion_part(rel) or file_mentions_fusion(child):
+            excluded.append(str(rel))
+            continue
+        link_path(child, target)
+    return sorted(set(excluded))
+
+
+def skill_dir_is_fusion(path, rel):
+    if path_has_fusion_part(rel):
+        return True
+    skill_file = path / "SKILL.md"
+    return skill_file.is_file() and file_mentions_fusion(skill_file)
+
+
+def mirror_skills_without_fusion(src, dst):
+    excluded = []
+    if not src.is_dir():
+        return excluded
+
+    def visit(current, rel):
+        if current.is_dir() and skill_dir_is_fusion(current, rel):
+            excluded.append(str(rel) or current.name)
+            return
+        if current.is_dir():
+            (dst / rel).mkdir(parents=True, exist_ok=True)
+            for child in sorted(current.iterdir()):
+                visit(child, rel / child.name)
+            return
+        if path_has_fusion_part(rel):
+            excluded.append(str(rel))
+            return
+        link_path(current, dst / rel)
+
+    for child in sorted(src.iterdir()):
+        visit(child, Path(child.name))
+    return sorted(set(excluded))
+
+
+def prepare_child_claude_config(result_dir):
+    source = claude_config_root()
+    target = result_dir / "child-claude-config"
+    if target.is_symlink():
+        target.unlink()
+    elif target.exists():
+        shutil.rmtree(target)
+    target.mkdir(parents=True, exist_ok=True)
+
+    excluded_commands = []
+    excluded_skills = []
+    if source.is_dir():
+        for child in sorted(source.iterdir()):
+            name = child.name
+            if name == "commands":
+                excluded_commands = mirror_commands_without_fusion(child, target / name)
+            elif name == "skills":
+                excluded_skills = mirror_skills_without_fusion(child, target / name)
+            elif name == "session-captures":
+                continue
+            else:
+                link_path(child, target / name)
+
+    return {
+        "source_config_dir": str(source),
+        "child_config_dir": str(target),
+        "fusion_command_disabled": True,
+        "fusion_skills_disabled": True,
+        "excluded_commands": excluded_commands,
+        "excluded_skills": excluded_skills,
+    }
 
 
 def resolve_claude_session(spec, workdir):
@@ -665,7 +773,6 @@ def make_headless_job(label, cmd, title, topic, workdir, session_id, launch_args
             "--output-format", "stream-json",
             "--verbose",
             "--name", title,
-            "--disable-slash-commands",
             "--append-system-prompt", system_prompt,
         ]
         + list(launch_args)
@@ -765,6 +872,7 @@ def manifest_payload(
     workdir,
     agent_jobs=None,
     started_at="",
+    child_config_info=None,
 ):
     expected = {f"fusion-{label}-{run_id}" for label, _ in agents}
     completed = completed_titles(rows)
@@ -802,6 +910,7 @@ def manifest_payload(
         "execution_mode": "headless-print",
         "result_dir": str(result_dir),
         "workdir": str(Path(workdir).resolve()),
+        "child_config": child_config_info or {},
         "topic": topic,
         "expected_titles": sorted(expected),
         "captured_titles": sorted(completed),
@@ -856,7 +965,7 @@ def running_fusion_processes(run_id):
     result = run(["ps", "-axo", "pid=,etime=,command="], check=False)
     if result.returncode != 0:
         return {}
-    pattern = re.compile(r"\bfusion-[^\s\"']*-" + re.escape(run_id) + r"\b")
+    pattern = re.compile(r"(?:^|\s)--name(?:=|\s+)([^\s\"']*fusion-[^\s\"']*-" + re.escape(run_id) + r")\b")
     found = {}
     current_pid = os.getpid()
     for line in result.stdout.splitlines():
@@ -981,6 +1090,11 @@ def format_status_text(run_dir, manifest, summaries, running):
         f"rollback_performed: {bool(manifest.get('rollback_performed'))}",
         f"retried_labels: {', '.join(manifest.get('retried_labels') or []) or '-'}",
     ])
+    child_config = manifest.get("child_config") or {}
+    if child_config:
+        lines.append(f"child_config_dir: {child_config.get('child_config_dir') or '-'}")
+        lines.append(f"disabled_commands: {', '.join(child_config.get('excluded_commands') or []) or '-'}")
+        lines.append(f"disabled_skills: {', '.join(child_config.get('excluded_skills') or []) or '-'}")
     if manifest.get("judge_prompt"):
         lines.append(f"judge_prompt: {manifest.get('judge_prompt')}")
 
@@ -1179,6 +1293,11 @@ def main():
     CAPTURE_ROOT.mkdir(parents=True, exist_ok=True)
     manifest_path = result_dir / "manifest.json"
     started_at = now_iso()
+    child_config_info = prepare_child_claude_config(result_dir)
+    child_env = {
+        "CLAUDE_CONFIG_DIR": child_config_info["child_config_dir"],
+        "CLAUDE_FUSION_CHILD": "1",
+    }
     write_json_file(manifest_path, {
         "run_id": run_id,
         "status": "initializing",
@@ -1187,6 +1306,7 @@ def main():
         "execution_mode": "headless-print",
         "result_dir": str(result_dir),
         "workdir": str(Path(args.workdir).resolve()),
+        "child_config": child_config_info,
         "topic": topic,
         "expected_titles": [],
         "captured_titles": [],
@@ -1231,6 +1351,7 @@ def main():
             workdir=args.workdir,
             agent_jobs=agent_jobs,
             started_at=started_at,
+            child_config_info=child_config_info,
         ))
 
     update_manifest("forking", [])
@@ -1260,6 +1381,7 @@ def main():
                 resume_session,
                 fork_args,
                 system_prompt,
+                env=child_env,
             )
         )
 
@@ -1299,7 +1421,7 @@ def main():
             retry_session,
             retry_args,
             system_prompt,
-            env=proxy_retry_env(),
+            env={**child_env, **proxy_retry_env()},
             env_unset=["ANTHROPIC_AUTH_TOKEN"],
             extra_args=["--model", "opus"],
             fallback="proxy-auth-retry",
