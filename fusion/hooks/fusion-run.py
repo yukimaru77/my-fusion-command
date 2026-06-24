@@ -1333,6 +1333,15 @@ def refuse_nested_fusion():
     return 0
 
 
+def in_fusion_child_env():
+    if os.environ.get("CLAUDE_FUSION_CHILD") == "1":
+        return True
+    config_root = claude_config_root()
+    if config_root.name != "child-claude-config":
+        return False
+    return any(part.startswith("fusion-run-") for part in config_root.parts)
+
+
 def assistant_text(row):
     message = row.get("message")
     if not isinstance(message, dict):
@@ -1428,7 +1437,7 @@ def main():
         return show_status(args.status, args.json)
     if args.cleanup_sessions is not None:
         return cleanup_run_sessions(args.cleanup_sessions, args.json)
-    if os.environ.get("CLAUDE_FUSION_CHILD") == "1":
+    if in_fusion_child_env():
         return refuse_nested_fusion()
 
     topic = " ".join(args.topic).strip()
