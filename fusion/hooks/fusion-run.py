@@ -42,9 +42,9 @@ def load_agents_config():
 DEFAULT_AGENTS = load_agents_config()
 
 
-def run(cmd, check=True):
+def run(cmd, check=True, env=None):
     try:
-        result = subprocess.run(cmd, text=True, capture_output=True)
+        result = subprocess.run(cmd, text=True, capture_output=True, env=env)
     except FileNotFoundError as exc:
         if check:
             raise RuntimeError(f"command not found: {cmd[0]}") from exc
@@ -79,10 +79,15 @@ def read_json_file(path):
 
 def process_base_env():
     env = os.environ.copy()
-    local_bin = str(HOME / ".local" / "bin")
+    preferred_bins = [
+        str(HOME / ".local" / "bin"),
+        "/opt/homebrew/bin",
+        "/usr/local/bin",
+    ]
     path_parts = env.get("PATH", "").split(os.pathsep) if env.get("PATH") else []
-    if local_bin not in path_parts:
-        env["PATH"] = local_bin + (os.pathsep + env["PATH"] if env.get("PATH") else "")
+    prepend = [path for path in preferred_bins if path not in path_parts and Path(path).is_dir()]
+    if prepend:
+        env["PATH"] = os.pathsep.join(prepend + path_parts)
     return env
 
 
@@ -272,7 +277,7 @@ def cleanup_child_session(config_root, session_id):
     missing = []
     errors = []
 
-    sdk_result = run([SDK_DELETE_BIN, session_id, str(root)], check=False)
+    sdk_result = run([SDK_DELETE_BIN, session_id, str(root)], check=False, env=process_base_env())
     if sdk_result.returncode == 0:
         try:
             payload = json.loads(sdk_result.stdout)
