@@ -57,39 +57,13 @@ def cmux(*args, check=True):
     return run(["cmux", *args], check=check)
 
 
-def tmux_session_has_clients(session_name):
-    result = tmux("list-clients", "-t", session_name, "-F", "#{client_tty}", check=False)
-    return result.returncode == 0 and bool(result.stdout.strip())
-
-
-def defer_tmux_cleanup_until_detached(session_name):
-    script = """
-session="$1"
-while tmux has-session -t "$session" 2>/dev/null; do
-  if ! tmux list-clients -t "$session" -F '#{client_tty}' 2>/dev/null | grep -q .; then
-    tmux kill-session -t "$session" 2>/dev/null || true
-    exit 0
-  fi
-  sleep 5
-done
-"""
-    subprocess.Popen(
-        ["sh", "-c", script, "fusion-cleanup", session_name],
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        start_new_session=True,
-    )
-
-
-def cleanup_tmux_session(session_name, keep_session):
+def cleanup_tmux_session(session_name, keep_session, capture_complete):
     if keep_session:
-        return False, False
-    if tmux_session_has_clients(session_name):
-        defer_tmux_cleanup_until_detached(session_name)
-        return False, True
+        return False, "keep-session"
+    if not capture_complete:
+        return False, "incomplete-capture"
     tmux("kill-session", "-t", session_name, check=False)
-    return True, False
+    return True, ""
 
 
 def unique_run_id():
@@ -535,7 +509,7 @@ def fork_launch_args(base_session, workdir, rollback_to_previous_turn, rollback_
 
 
 def pane_text(session_name, idx):
-    result = tmux("capture-pane", "-t", f"{session_name}:{idx}", "-p", check=False)
+    result = tmux("capture-pane", "-t", f"{session_name}:{idx}", "-p", "-S", "-", check=False)
     return result.stdout or ""
 
 
@@ -543,17 +517,18 @@ def pane_tail(session_name, idx, lines=50):
     return "\n".join(pane_text(session_name, idx).splitlines()[-lines:])
 
 
+def pane_has_prompt(text):
+    return any(re.match(r"^\s*❯", line) for line in (text or "").splitlines())
+
+
 def pane_is_idle(session_name, idx, title):
     tail = pane_tail(session_name, idx)
-    return (
-        "esc to interrupt" not in tail
-        and any(line.strip().startswith("❯") for line in tail.splitlines())
-    )
+    return pane_has_prompt(tail)
 
 
 def pane_is_busy(session_name, idx, title):
     tail = pane_tail(session_name, idx)
-    return "esc to interrupt" in tail
+    return not pane_has_prompt(tail) and "esc to interrupt" in tail
 
 
 def wait_for_ready(session_name, idx, title, timeout_s, cancel_startup=False):
@@ -689,12 +664,24 @@ def collect_by_title(run_id, agents, timeout_s, session_name=None, topic=None, m
                 by_title[title] = candidate
         rows = list(by_title.values())
         if topic:
+            idle_titles = set()
+            if session_name:
+                for idx, (label, _) in enumerate(agents):
+                    title = f"fusion-{label}-{run_id}"
+                    if pane_is_idle(session_name, idx, title):
+                        idle_titles.add(title)
             existing = {
                 summary.get("session_title")
                 for _, _, summary in rows
                 if summary_is_complete(summary)
             }
-            for row in collect_from_fork_transcripts(fork_session_ids, agents, topic, expected - existing):
+            for row in collect_from_fork_transcripts(
+                fork_session_ids,
+                agents,
+                topic,
+                expected - existing,
+                idle_titles=idle_titles,
+            ):
                 rows = replace_row_by_title(rows, row)
                 existing.add(row[2].get("session_title"))
             if session_name:
@@ -729,7 +716,11 @@ def completed_titles(rows):
 
 
 def summary_is_complete(summary):
-    return len(summary.get("stops") or []) >= 1 and bool((summary.get("last_assistant") or "").strip())
+    if not bool((summary.get("last_assistant") or "").strip()):
+        return False
+    if summary.get("complete") is False:
+        return False
+    return summary.get("complete") is True or len(summary.get("stops") or []) >= 1
 
 
 def replace_row_by_title(rows, row):
@@ -761,31 +752,37 @@ def prompt_matches(row, topic):
     return command_prompt_text(human_prompt_text(row)).strip() == topic.strip()
 
 
-def latest_assistant_after_prompt(session_id, topic):
+def latest_final_assistant_after_prompt(session_id, topic, allow_open_stop=False):
     transcript = find_new_transcript(claude_config_root(), session_id)
     if transcript is None:
         return "", ""
     rows = read_jsonl(transcript)
     after_prompt = False
-    last = ""
+    last_final = ""
+    last_open_stop = ""
     for row in rows:
         if row.get("sessionId") != session_id:
             continue
         if prompt_matches(row, topic):
             after_prompt = True
-            last = ""
+            last_final = ""
+            last_open_stop = ""
             continue
         if after_prompt and row.get("type") == "assistant":
             text = assistant_text(row)
-            if text:
-                last = text
-    return last.strip(), str(transcript)
+            stop_reason = (row.get("message") or {}).get("stop_reason")
+            if text and stop_reason == "end_turn":
+                last_final = text
+            elif text and allow_open_stop and not stop_reason:
+                last_open_stop = text
+    return (last_final or last_open_stop).strip(), str(transcript)
 
 
-def collect_from_fork_transcripts(fork_session_ids, agents, topic, titles):
+def collect_from_fork_transcripts(fork_session_ids, agents, topic, titles, idle_titles=None):
     rows = []
     if not fork_session_ids:
         return rows
+    idle_titles = idle_titles or set()
     for label, _cmd in agents:
         expected_title = next((item for item in titles if item.startswith(f"fusion-{label}-")), "")
         if not expected_title:
@@ -793,7 +790,11 @@ def collect_from_fork_transcripts(fork_session_ids, agents, topic, titles):
         session_id = fork_session_ids.get(label)
         if not session_id:
             continue
-        answer, path = latest_assistant_after_prompt(session_id, topic)
+        answer, path = latest_final_assistant_after_prompt(
+            session_id,
+            topic,
+            allow_open_stop=expected_title in idle_titles,
+        )
         if not answer:
             continue
         rows.append((
@@ -803,6 +804,7 @@ def collect_from_fork_transcripts(fork_session_ids, agents, topic, titles):
                 "session_title": expected_title,
                 "prompts": [{"prompt": topic}],
                 "last_assistant": answer,
+                "complete": True,
                 "stops": [{"event": "TranscriptFallback"}],
             },
         ))
@@ -852,6 +854,7 @@ def collect_from_panes(session_name, agents, topic, titles, marker_topic=None):
                 "session_title": expected_title,
                 "prompts": [{"prompt": topic}],
                 "last_assistant": answer,
+                "complete": True,
                 "stops": [{"event": "PaneFallback"}],
             },
         ))
@@ -870,6 +873,8 @@ def build_judge_prompt(topic, run_id, rows):
         "--- fork outputs ---",
     ]
     for sid, path, summary in sorted(rows, key=lambda item: item[2].get("session_title") or ""):
+        if not summary_is_complete(summary):
+            continue
         title = summary.get("session_title") or sid
         last = summary.get("last_assistant") or ""
         if not last.strip():
@@ -1002,7 +1007,18 @@ def main():
     completed = completed_titles(rows)
     if completed != expected:
         existing = completed_titles(rows)
-        for row in collect_from_fork_transcripts(fork_session_ids, agents, topic, expected - existing):
+        idle_titles = set()
+        for idx, (label, _) in enumerate(agents):
+            title = f"fusion-{label}-{run_id}"
+            if pane_is_idle(session_name, idx, title):
+                idle_titles.add(title)
+        for row in collect_from_fork_transcripts(
+            fork_session_ids,
+            agents,
+            topic,
+            expected - existing,
+            idle_titles=idle_titles,
+        ):
             rows = replace_row_by_title(rows, row)
             existing.add(row[2].get("session_title"))
         for row in collect_from_panes(session_name, agents, topic, expected - existing):
@@ -1010,6 +1026,7 @@ def main():
             existing.add(row[2].get("session_title"))
         completed = completed_titles(rows)
     missing = expected - completed
+    capture_complete = expected <= completed
 
     for idx, (label, _) in enumerate(agents):
         title = f"fusion-{label}-{run_id}"
@@ -1018,18 +1035,22 @@ def main():
 
     judge_prompt = build_judge_prompt(topic, run_id, rows)
     (result_dir / "judge-prompt.md").write_text(judge_prompt, encoding="utf-8")
-    cleaned_tmux_session, cleanup_deferred = cleanup_tmux_session(session_name, args.keep_session)
+    cleaned_tmux_session, tmux_retained_reason = cleanup_tmux_session(
+        session_name,
+        args.keep_session,
+        capture_complete,
+    )
 
     (result_dir / "manifest.json").write_text(json.dumps({
         "run_id": run_id,
         "tmux_session": session_name,
         "tmux_session_cleaned": cleaned_tmux_session,
-        "tmux_session_cleanup_deferred": cleanup_deferred,
+        "tmux_session_retained_reason": tmux_retained_reason,
         "topic": topic,
         "expected_titles": sorted(expected),
         "captured_titles": sorted(completed),
         "incomplete_titles": sorted(missing),
-        "complete": expected <= completed,
+        "complete": capture_complete,
         "fork_mode": fork_mode,
         "rollback_performed": rollback_forks,
         "source_latest_prompt": compact(invocation_info.get("latest_prompt", ""), 1200),
@@ -1046,8 +1067,8 @@ def main():
         print(f"CMUX_MONITOR_SURFACE={cmux_monitor_surface}")
     if cleaned_tmux_session:
         print("TMUX_SESSION_CLEANED=1")
-    if cleanup_deferred:
-        print("TMUX_SESSION_CLEANUP_DEFERRED=1")
+    if tmux_retained_reason:
+        print(f"TMUX_SESSION_RETAINED={tmux_retained_reason}")
     print(f"FORK_MODE={fork_mode}")
     print(f"CAPTURED={len(completed)}/{len(expected)}")
     if missing:
