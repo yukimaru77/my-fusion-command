@@ -56,6 +56,34 @@ def unique_run_id():
     return f"{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:8]}"
 
 
+def now_iso():
+    return time.strftime("%Y-%m-%dT%H:%M:%S%z")
+
+
+def write_json_file(path, payload):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    tmp.replace(path)
+
+
+def read_json_file(path):
+    try:
+        return json.loads(Path(path).read_text(encoding="utf-8", errors="replace"))
+    except Exception:
+        return {}
+
+
+def process_base_env():
+    env = os.environ.copy()
+    local_bin = str(HOME / ".local" / "bin")
+    path_parts = env.get("PATH", "").split(os.pathsep) if env.get("PATH") else []
+    if local_bin not in path_parts:
+        env["PATH"] = local_bin + (os.pathsep + env["PATH"] if env.get("PATH") else "")
+    return env
+
+
 def parse_agents(value):
     if not value:
         return DEFAULT_AGENTS
@@ -483,7 +511,7 @@ def fork_launch_args(base_session, workdir, rollback_to_previous_turn, rollback_
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
-        env=os.environ.copy(),
+        env=process_base_env(),
         check=False,
     )
     if result.returncode != 0:
@@ -573,7 +601,7 @@ def run_headless_agent(agent, timeout_s, result_dir):
     stderr = ""
     returncode = 1
     try:
-        proc_env = os.environ.copy()
+        proc_env = process_base_env()
         for key in agent.get("env_unset") or []:
             proc_env.pop(key, None)
         proc_env.update(agent.get("env") or {})
@@ -686,6 +714,364 @@ def summary_is_complete(summary):
     return summary.get("complete") is True or len(summary.get("stops") or []) >= 1
 
 
+def label_from_title(title, run_id):
+    prefix = "fusion-"
+    suffix = f"-{run_id}"
+    if isinstance(title, str) and title.startswith(prefix) and title.endswith(suffix):
+        return title[len(prefix):-len(suffix)]
+    return ""
+
+
+def run_id_from_dir(path):
+    name = Path(path).name
+    prefix = "fusion-run-"
+    return name[len(prefix):] if name.startswith(prefix) else name
+
+
+def agent_result_payload(sid, path, summary, run_id):
+    title = summary.get("session_title") or ""
+    label = label_from_title(title, run_id) or Path(path).name.removesuffix(".summary.json")
+    stops = summary.get("stops") or []
+    stop = stops[-1] if stops and isinstance(stops[-1], dict) else {}
+    return {
+        "label": label,
+        "session_id": summary.get("session_id") or sid,
+        "summary_path": str(path),
+        "stdout_path": summary.get("stdout_path") or str(Path(path).with_name(f"{label}.stdout.jsonl")),
+        "stderr_path": summary.get("stderr_path") or str(Path(path).with_name(f"{label}.stderr.txt")),
+        "session_title": title,
+        "complete": summary_is_complete(summary),
+        "error": summary.get("error") or "",
+        "timed_out": bool(summary.get("timed_out")),
+        "duration_ms": summary.get("duration_ms"),
+        "fallback": summary.get("fallback") or "",
+        "returncode": stop.get("returncode"),
+    }
+
+
+def manifest_payload(
+    *,
+    run_id,
+    result_dir,
+    topic,
+    agents,
+    rows,
+    fork_mode,
+    rollback_forks,
+    invocation_info,
+    fork_session_ids,
+    retried_labels,
+    status,
+    workdir,
+    agent_jobs=None,
+    started_at="",
+):
+    expected = {f"fusion-{label}-{run_id}" for label, _ in agents}
+    completed = completed_titles(rows)
+    missing = expected - completed
+    agent_results = [agent_result_payload(sid, path, summary, run_id) for sid, path, summary in rows]
+    seen_titles = {item.get("session_title") for item in agent_results}
+    for job in agent_jobs or []:
+        if job["title"] in seen_titles:
+            continue
+        label = job["label"]
+        agent_results.append({
+            "label": label,
+            "session_id": fork_session_ids.get(label, job["session_id"]),
+            "summary_path": str(result_dir / f"{label}.summary.json"),
+            "stdout_path": str(result_dir / f"{label}.stdout.jsonl"),
+            "stderr_path": str(result_dir / f"{label}.stderr.txt"),
+            "session_title": job["title"],
+            "complete": False,
+            "error": "",
+            "timed_out": False,
+            "duration_ms": None,
+            "fallback": job.get("fallback", ""),
+            "returncode": None,
+        })
+    for item in agent_results:
+        label = item.get("label")
+        if label in fork_session_ids:
+            item["session_id"] = fork_session_ids[label]
+    agent_results.sort(key=lambda item: item.get("label") or item.get("session_title") or "")
+    return {
+        "run_id": run_id,
+        "status": status,
+        "started_at": started_at,
+        "updated_at": now_iso(),
+        "execution_mode": "headless-print",
+        "result_dir": str(result_dir),
+        "workdir": str(Path(workdir).resolve()),
+        "topic": topic,
+        "expected_titles": sorted(expected),
+        "captured_titles": sorted(completed),
+        "incomplete_titles": sorted(missing),
+        "complete": expected <= completed,
+        "fork_mode": fork_mode,
+        "rollback_performed": rollback_forks,
+        "source_session": invocation_info.get("source_session", ""),
+        "source_path": invocation_info.get("source_path", ""),
+        "source_latest_prompt": compact(invocation_info.get("latest_prompt", ""), 1200),
+        "source_session_prompt": compact(invocation_info.get("source_prompt", ""), 1200),
+        "history_latest_prompt": compact(invocation_info.get("history_prompt", ""), 1200),
+        "fork_session_ids": dict(fork_session_ids),
+        "retried_labels": list(retried_labels),
+        "agent_results": agent_results,
+        "judge_prompt": str(result_dir / "judge-prompt.md"),
+    }
+
+
+def resolve_run_dir(spec):
+    value = spec or "latest"
+    if value in {"latest", "current"}:
+        dirs = sorted(
+            [p for p in CAPTURE_ROOT.glob("fusion-run-*") if p.is_dir()],
+            key=lambda item: item.stat().st_mtime,
+            reverse=True,
+        )
+        if not dirs:
+            raise RuntimeError(f"no fusion run directories under {CAPTURE_ROOT}")
+        return dirs[0]
+    candidate = Path(value).expanduser()
+    if candidate.is_dir():
+        return candidate.resolve()
+    name = value if value.startswith("fusion-run-") else f"fusion-run-{value}"
+    candidate = CAPTURE_ROOT / name
+    if candidate.is_dir():
+        return candidate.resolve()
+    raise RuntimeError(f"fusion run not found: {value}")
+
+
+def load_run_summaries(run_dir):
+    summaries = {}
+    for path in sorted(Path(run_dir).glob("*.summary.json")):
+        label = path.name.removesuffix(".summary.json")
+        value = read_json_file(path)
+        if isinstance(value, dict) and value:
+            summaries[label] = value
+    return summaries
+
+
+def running_fusion_processes(run_id):
+    result = run(["ps", "-axo", "pid=,etime=,command="], check=False)
+    if result.returncode != 0:
+        return {}
+    pattern = re.compile(r"\bfusion-[^\s\"']*-" + re.escape(run_id) + r"\b")
+    found = {}
+    current_pid = os.getpid()
+    for line in result.stdout.splitlines():
+        parts = line.strip().split(None, 2)
+        if len(parts) < 3:
+            continue
+        try:
+            pid = int(parts[0])
+        except ValueError:
+            continue
+        if pid == current_pid:
+            continue
+        elapsed = parts[1]
+        command = parts[2]
+        for match in pattern.findall(command):
+            title = match.strip("'\"")
+            found[title] = {"pid": pid, "elapsed": elapsed}
+    return found
+
+
+def format_duration(duration_ms):
+    if duration_ms is None:
+        return "-"
+    try:
+        seconds = int(duration_ms) / 1000
+    except (TypeError, ValueError):
+        return "-"
+    if seconds < 60:
+        return f"{seconds:.1f}s"
+    minutes, seconds = divmod(seconds, 60)
+    if minutes < 60:
+        return f"{int(minutes)}m{seconds:04.1f}s"
+    hours, minutes = divmod(minutes, 60)
+    return f"{int(hours)}h{int(minutes):02d}m{seconds:04.1f}s"
+
+
+def one_line(text, limit=240):
+    value = (text or "").replace("\r", " ").replace("\n", " ").strip()
+    return compact(value, limit)
+
+
+def format_status_text(run_dir, manifest, summaries, running):
+    run_id = manifest.get("run_id") or run_id_from_dir(run_dir)
+    expected = set(manifest.get("expected_titles") or [])
+    captured = set(manifest.get("captured_titles") or [])
+    running_titles = set(running.keys())
+    state = "running" if running_titles else ("complete" if manifest.get("complete") else "incomplete")
+    agent_rows = {}
+
+    for item in manifest.get("agent_results") or []:
+        if not isinstance(item, dict):
+            continue
+        label = item.get("label") or label_from_title(item.get("session_title"), run_id)
+        if label:
+            agent_rows[label] = dict(item)
+
+    for label, summary in summaries.items():
+        title = summary.get("session_title") or f"fusion-{label}-{run_id}"
+        agent_rows[label] = {
+            **agent_rows.get(label, {}),
+            **agent_result_payload(summary.get("session_id") or "", Path(run_dir) / f"{label}.summary.json", summary, run_id),
+            "session_title": title,
+        }
+
+    for title in running_titles:
+        label = label_from_title(title, run_id)
+        if label and label not in agent_rows:
+            agent_rows[label] = {
+                "label": label,
+                "session_title": title,
+                "session_id": (manifest.get("fork_session_ids") or {}).get(label, ""),
+                "summary_path": str(Path(run_dir) / f"{label}.summary.json"),
+                "stdout_path": str(Path(run_dir) / f"{label}.stdout.jsonl"),
+                "stderr_path": str(Path(run_dir) / f"{label}.stderr.txt"),
+                "complete": False,
+                "error": "",
+                "duration_ms": None,
+                "fallback": "",
+            }
+
+    for label, sid in (manifest.get("fork_session_ids") or {}).items():
+        agent_rows.setdefault(label, {
+            "label": label,
+            "session_title": f"fusion-{label}-{run_id}",
+            "session_id": sid,
+            "summary_path": str(Path(run_dir) / f"{label}.summary.json"),
+            "stdout_path": str(Path(run_dir) / f"{label}.stdout.jsonl"),
+            "stderr_path": str(Path(run_dir) / f"{label}.stderr.txt"),
+            "complete": False,
+            "error": "",
+            "duration_ms": None,
+            "fallback": "",
+        })
+
+    if not expected and agent_rows:
+        expected = {row.get("session_title") for row in agent_rows.values() if row.get("session_title")}
+    if not captured:
+        captured = {
+            row.get("session_title")
+            for row in agent_rows.values()
+            if row.get("session_title") and row.get("complete")
+        }
+
+    lines = [
+        "Fusion status",
+        f"run_id: {run_id}",
+        f"state: {state}",
+        f"phase: {manifest.get('status') or '-'}",
+        f"captured: {len(captured)}/{len(expected) if expected else len(agent_rows)}",
+        f"result_dir: {run_dir}",
+    ]
+    if manifest.get("updated_at"):
+        lines.append(f"updated_at: {manifest.get('updated_at')}")
+    if manifest.get("workdir"):
+        lines.append(f"workdir: {manifest.get('workdir')}")
+    if manifest.get("topic"):
+        lines.append(f"prompt: {one_line(manifest.get('topic'), 500)}")
+    if manifest.get("source_latest_prompt"):
+        lines.append(f"source_latest_prompt: {one_line(manifest.get('source_latest_prompt'), 500)}")
+    lines.extend([
+        f"fork_mode: {manifest.get('fork_mode') or '-'}",
+        f"rollback_performed: {bool(manifest.get('rollback_performed'))}",
+        f"retried_labels: {', '.join(manifest.get('retried_labels') or []) or '-'}",
+    ])
+    if manifest.get("judge_prompt"):
+        lines.append(f"judge_prompt: {manifest.get('judge_prompt')}")
+
+    lines.append("")
+    lines.append("fork sessions:")
+    fork_session_ids = manifest.get("fork_session_ids") or {}
+    if fork_session_ids:
+        for label in sorted(fork_session_ids):
+            lines.append(f"  {label}: {fork_session_ids[label]}")
+    else:
+        lines.append("  -")
+
+    lines.append("")
+    lines.append("agents:")
+    if not agent_rows:
+        lines.append("  -")
+    for label in sorted(agent_rows):
+        row = agent_rows[label]
+        title = row.get("session_title") or f"fusion-{label}-{run_id}"
+        proc = running.get(title)
+        complete = bool(row.get("complete"))
+        error = row.get("error") or ""
+        if proc and not complete:
+            agent_state = f"running pid={proc['pid']} elapsed={proc['elapsed']}"
+        elif complete:
+            agent_state = "complete"
+        elif error:
+            agent_state = "failed"
+        else:
+            agent_state = "pending"
+        suffix = []
+        if row.get("session_id"):
+            suffix.append(f"session={row.get('session_id')}")
+        if row.get("duration_ms") is not None:
+            suffix.append(f"duration={format_duration(row.get('duration_ms'))}")
+        if row.get("fallback"):
+            suffix.append(f"fallback={row.get('fallback')}")
+        lines.append(f"  {label}: {agent_state}" + (f" ({', '.join(suffix)})" if suffix else ""))
+        if error:
+            lines.append(f"    error: {one_line(error, 500)}")
+        lines.append(f"    summary: {row.get('summary_path')}")
+        lines.append(f"    stdout: {row.get('stdout_path')}")
+        lines.append(f"    stderr: {row.get('stderr_path')}")
+
+    incomplete = manifest.get("incomplete_titles") or []
+    if incomplete:
+        lines.append("")
+        lines.append("incomplete_titles:")
+        for title in incomplete:
+            lines.append(f"  {title}")
+    return "\n".join(lines)
+
+
+def status_payload(run_dir):
+    run_id = run_id_from_dir(run_dir)
+    manifest = read_json_file(Path(run_dir) / "manifest.json")
+    if not manifest:
+        manifest = {
+            "run_id": run_id,
+            "result_dir": str(run_dir),
+            "complete": False,
+            "agent_results": [],
+            "fork_session_ids": {},
+        }
+    manifest.setdefault("run_id", run_id)
+    manifest.setdefault("result_dir", str(run_dir))
+    summaries = load_run_summaries(run_dir)
+    running = running_fusion_processes(run_id)
+    return {
+        "run_dir": str(run_dir),
+        "manifest": manifest,
+        "summaries": summaries,
+        "running_processes": running,
+    }
+
+
+def show_status(spec, output_json=False):
+    run_dir = resolve_run_dir(spec)
+    payload = status_payload(run_dir)
+    if output_json:
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+    else:
+        print(format_status_text(
+            Path(payload["run_dir"]),
+            payload["manifest"],
+            payload["summaries"],
+            payload["running_processes"],
+        ))
+    return 0
+
+
 def assistant_text(row):
     message = row.get("message")
     if not isinstance(message, dict):
@@ -772,7 +1158,12 @@ def main():
     )
     parser.add_argument("--workdir", default=WORKDIR_DEFAULT)
     parser.add_argument("--timeout", type=int, default=7200)
+    parser.add_argument("--status", nargs="?", const="latest", help="Show the latest or specified fusion run status and exit")
+    parser.add_argument("--json", action="store_true", help="With --status, output machine-readable JSON")
     args = parser.parse_args()
+    if args.status is not None:
+        return show_status(args.status, args.json)
+
     topic = " ".join(args.topic).strip()
     if not topic:
         print("Usage: /fusion <プロンプト>", file=os.sys.stderr)
@@ -786,6 +1177,28 @@ def main():
     result_dir = CAPTURE_ROOT / f"fusion-run-{run_id}"
     result_dir.mkdir(parents=True, exist_ok=True)
     CAPTURE_ROOT.mkdir(parents=True, exist_ok=True)
+    manifest_path = result_dir / "manifest.json"
+    started_at = now_iso()
+    write_json_file(manifest_path, {
+        "run_id": run_id,
+        "status": "initializing",
+        "started_at": started_at,
+        "updated_at": started_at,
+        "execution_mode": "headless-print",
+        "result_dir": str(result_dir),
+        "workdir": str(Path(args.workdir).resolve()),
+        "topic": topic,
+        "expected_titles": [],
+        "captured_titles": [],
+        "incomplete_titles": [],
+        "complete": False,
+        "fork_mode": "initializing",
+        "rollback_performed": False,
+        "fork_session_ids": {},
+        "retried_labels": [],
+        "agent_results": [],
+        "judge_prompt": str(result_dir / "judge-prompt.md"),
+    })
 
     invocation_info = {}
     rollback_forks = False
@@ -800,6 +1213,27 @@ def main():
     fork_session_ids = {}
     agent_jobs = []
     agent_commands = {}
+    retried_labels = []
+
+    def update_manifest(status, rows):
+        write_json_file(manifest_path, manifest_payload(
+            run_id=run_id,
+            result_dir=result_dir,
+            topic=topic,
+            agents=agents,
+            rows=rows,
+            fork_mode=fork_mode,
+            rollback_forks=rollback_forks,
+            invocation_info=invocation_info,
+            fork_session_ids=fork_session_ids,
+            retried_labels=retried_labels,
+            status=status,
+            workdir=args.workdir,
+            agent_jobs=agent_jobs,
+            started_at=started_at,
+        ))
+
+    update_manifest("forking", [])
 
     for label, cmd in agents:
         title = f"fusion-{label}-{run_id}"
@@ -830,12 +1264,13 @@ def main():
         )
 
     rows = []
+    update_manifest("running", rows)
     with ThreadPoolExecutor(max_workers=len(agent_jobs)) as executor:
         futures = [executor.submit(run_headless_agent, job, args.timeout, result_dir) for job in agent_jobs]
         for future in as_completed(futures):
             rows.append(future.result())
+            update_manifest("running", rows)
 
-    retried_labels = []
     by_title = {summary.get("session_title"): (sid, path, summary) for sid, path, summary in rows}
     for label, _cmd in agents:
         title = f"fusion-{label}-{run_id}"
@@ -853,6 +1288,8 @@ def main():
         else:
             retry_session, retry_args = new_session_launch_args()
         fork_session_ids[label] = retry_session
+        retried_labels.append(label)
+        update_manifest(f"retrying-{label}", list(by_title.values()))
         retry_job = make_headless_job(
             label,
             agent_commands[label],
@@ -869,7 +1306,7 @@ def main():
         )
         retry_row = run_headless_agent(retry_job, args.timeout, result_dir)
         by_title[title] = retry_row
-        retried_labels.append(label)
+        update_manifest("running", list(by_title.values()))
     rows = list(by_title.values())
 
     expected = {f"fusion-{label}-{run_id}" for label, _ in agents}
@@ -880,34 +1317,7 @@ def main():
     judge_prompt = build_judge_prompt(topic, run_id, rows)
     (result_dir / "judge-prompt.md").write_text(judge_prompt, encoding="utf-8")
 
-    (result_dir / "manifest.json").write_text(json.dumps({
-        "run_id": run_id,
-        "execution_mode": "headless-print",
-        "topic": topic,
-        "expected_titles": sorted(expected),
-        "captured_titles": sorted(completed),
-        "incomplete_titles": sorted(missing),
-        "complete": capture_complete,
-        "fork_mode": fork_mode,
-        "rollback_performed": rollback_forks,
-        "source_latest_prompt": compact(invocation_info.get("latest_prompt", ""), 1200),
-        "source_session_prompt": compact(invocation_info.get("source_prompt", ""), 1200),
-        "history_latest_prompt": compact(invocation_info.get("history_prompt", ""), 1200),
-        "fork_session_ids": fork_session_ids,
-        "retried_labels": retried_labels,
-        "agent_results": [
-            {
-                "session_id": sid,
-                "summary_path": str(path),
-                "session_title": summary.get("session_title"),
-                "complete": summary_is_complete(summary),
-                "error": summary.get("error") or "",
-                "duration_ms": summary.get("duration_ms"),
-            }
-            for sid, path, summary in rows
-        ],
-        "judge_prompt": str(result_dir / "judge-prompt.md"),
-    }, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    update_manifest("complete" if capture_complete else "incomplete", rows)
 
     print(f"FUSION_RUN_ID={run_id}")
     print("EXECUTION_MODE=headless-print")

@@ -196,3 +196,4 @@ sqlite3 ~/.cc-switch/cc-switch.db \
 - 子 fork は `--disable-slash-commands` と `--append-system-prompt` 付きで起動する。direct `/fusion` では `/fusion` 自体が履歴に残らない状態で prompt だけを送る。
 - fork の対応付けは prompt 内タグではなく `--name fusion-<agent>-<run_id>` と child session id で行う。
 - `~/.claude/projects/**/*.jsonl` は rollback 検証に使う。回答収集は headless 実行の stream-json result を優先する。
+- `/fusion` の状態確認は `~/.claude/hooks/fusion-run.py --status` で行う。実行開始直後から `manifest.json` を作り、prompt、fork session id、rollback有無、各agentの running/complete/failed、summary/stdout/stderr/judge prompt パスを確認できるようにする。

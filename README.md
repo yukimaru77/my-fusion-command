@@ -115,6 +115,30 @@ Claude Code のセッション内で:
 
 `/fusion` の収集 timeout はデフォルト120分です。長いコードレビューや全ファイル精査でも途中回答を拾って終わらないよう、slash command 側も Bash tool timeout を120分に設定します。
 
+## デバッグ/状態確認
+
+最新の `/fusion` run は1コマンドで確認できます。
+
+```bash
+~/.claude/hooks/fusion-run.py --status
+```
+
+特定runを見る場合:
+
+```bash
+~/.claude/hooks/fusion-run.py --status 20260624-223318-cee5799d
+```
+
+表示される内容:
+
+- run id / result directory / prompt
+- direct `/fusion` rollback が実行されたか
+- child session id
+- 各agentの running / complete / failed 状態、pid、duration
+- summary / stdout / stderr / judge prompt のファイルパス
+
+実行開始直後から `~/.claude/session-captures/fusion-run-<run_id>/manifest.json` が作られ、agent完了ごとに更新されます。
+
 ## 動作確認
 
 ```bash
@@ -130,4 +154,7 @@ test -d ~/.claude/fusion-sdk/node_modules/@anthropic-ai/claude-agent-sdk && echo
 # 構文チェック
 python3 -m py_compile ~/.claude/hooks/fusion-run.py
 node ~/.claude/hooks/fusion-sdk-fork.mjs || test $? -eq 2
+
+# 最新runの状態確認
+~/.claude/hooks/fusion-run.py --status
 ```
