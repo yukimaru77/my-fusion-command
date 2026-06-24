@@ -31,6 +31,14 @@ def read_stdin_json():
         return {"_parse_error": True}, raw
 
 
+def output_payload(event):
+    # Stop/SubagentStop decision schemas are stricter in recent Claude Code.
+    # Empty JSON means "allow stop" without adding transcript noise.
+    if event in ("Stop", "SubagentStop"):
+        return {}
+    return {"suppressOutput": True}
+
+
 def find_transcript(session_id, cwd=None, transcript_path=None):
     if transcript_path:
         path = Path(transcript_path).expanduser()
@@ -154,7 +162,8 @@ def summarize_transcript(src, dst_summary):
 
 def main():
     if not capture_enabled():
-        print(json.dumps({"suppressOutput": True}, ensure_ascii=False))
+        event = os.environ.get("CLAUDE_HOOK_EVENT") or (sys.argv[1] if len(sys.argv) > 1 else "unknown")
+        print(json.dumps(output_payload(event), ensure_ascii=False))
         return
     payload, raw = read_stdin_json()
     event = os.environ.get("CLAUDE_HOOK_EVENT") or payload.get("hook_event_name") or (sys.argv[1] if len(sys.argv) > 1 else "unknown")
@@ -176,7 +185,7 @@ def main():
         manifest["size_bytes"] = dst.stat().st_size
     (session_dir / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     append_jsonl(CAPTURE_ROOT / "index.jsonl", manifest)
-    print(json.dumps({"suppressOutput": True}, ensure_ascii=False))
+    print(json.dumps(output_payload(event), ensure_ascii=False))
 
 
 if __name__ == "__main__":
