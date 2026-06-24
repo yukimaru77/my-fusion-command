@@ -111,7 +111,7 @@ Claude Code のセッション内で:
 /fusion 設計についてどう思う？
 ```
 
-実行中は `claude` / `codex` / `glm` が裏側で headless に並列実行されます。tmux や cmux の pane は作りません。各 run と child session id は毎回新しく生成されるため、前回の `/fusion` の続きから始まることはありません。
+実行中は `claude` / `codex` / `glm` が裏側で headless に並列実行されます。tmux や cmux の pane は作りません。各 run と child session id は毎回新しく生成されるため、前回の `/fusion` の続きから始まることはありません。headless の official `claude` が OAuth/keychain を拾えず認証失敗した場合は、他 agent の完了後に CC Switch proxy 経由で `claude` だけ再試行します。
 
 `/fusion` の収集 timeout はデフォルト120分です。長いコードレビューや全ファイル精査でも途中回答を拾って終わらないよう、slash command 側も Bash tool timeout を120分に設定します。
 

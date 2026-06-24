@@ -573,6 +573,10 @@ def run_headless_agent(agent, timeout_s, result_dir):
     stderr = ""
     returncode = 1
     try:
+        proc_env = os.environ.copy()
+        for key in agent.get("env_unset") or []:
+            proc_env.pop(key, None)
+        proc_env.update(agent.get("env") or {})
         proc = subprocess.Popen(
             agent["argv"],
             cwd=agent["workdir"],
@@ -580,7 +584,7 @@ def run_headless_agent(agent, timeout_s, result_dir):
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
-            env=os.environ.copy(),
+            env=proc_env,
             start_new_session=True,
         )
         try:
@@ -616,11 +620,54 @@ def run_headless_agent(agent, timeout_s, result_dir):
         "duration_ms": duration_ms,
         "session_id": observed_session_id or agent["session_id"],
         "argv": agent["argv"],
+        "fallback": agent.get("fallback", ""),
         "stdout_path": str(stdout_path),
         "stderr_path": str(stderr_path),
     }
     summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     return (agent["session_id"], summary_path, summary)
+
+
+def make_headless_job(label, cmd, title, topic, workdir, session_id, launch_args, system_prompt, *, env=None, env_unset=None, extra_args=None, fallback=""):
+    argv = (
+        shlex.split(cmd)
+        + list(extra_args or [])
+        + [
+            "-p",
+            "--output-format", "stream-json",
+            "--verbose",
+            "--name", title,
+            "--disable-slash-commands",
+            "--append-system-prompt", system_prompt,
+        ]
+        + list(launch_args)
+        + [topic]
+    )
+    return {
+        "label": label,
+        "title": title,
+        "argv": argv,
+        "workdir": workdir,
+        "topic": topic,
+        "session_id": session_id,
+        "env": env or {},
+        "env_unset": env_unset or [],
+        "fallback": fallback,
+    }
+
+
+def auth_error_needs_proxy_retry(label, summary):
+    if label != "claude" or summary_is_complete(summary):
+        return False
+    error = (summary.get("error") or summary.get("last_assistant") or "").lower()
+    return "not logged in" in error or "authentication_failed" in error
+
+
+def proxy_retry_env():
+    return {
+        "ANTHROPIC_BASE_URL": "http://127.0.0.1:15721",
+        "ANTHROPIC_API_KEY": "PROXY_MANAGED",
+    }
 
 
 def completed_titles(rows):
@@ -752,6 +799,7 @@ def main():
 
     fork_session_ids = {}
     agent_jobs = []
+    agent_commands = {}
 
     for label, cmd in agents:
         title = f"fusion-{label}-{run_id}"
@@ -767,33 +815,62 @@ def main():
         else:
             resume_session, fork_args = new_session_launch_args()
         fork_session_ids[label] = resume_session
-        argv = (
-            shlex.split(cmd)
-            + [
-                "-p",
-                "--output-format", "stream-json",
-                "--verbose",
-                "--name", title,
-                "--disable-slash-commands",
-                "--append-system-prompt", system_prompt,
-            ]
-            + fork_args
-            + [topic]
+        agent_commands[label] = cmd
+        agent_jobs.append(
+            make_headless_job(
+                label,
+                cmd,
+                title,
+                topic,
+                args.workdir,
+                resume_session,
+                fork_args,
+                system_prompt,
+            )
         )
-        agent_jobs.append({
-            "label": label,
-            "title": title,
-            "argv": argv,
-            "workdir": args.workdir,
-            "topic": topic,
-            "session_id": resume_session,
-        })
 
     rows = []
     with ThreadPoolExecutor(max_workers=len(agent_jobs)) as executor:
         futures = [executor.submit(run_headless_agent, job, args.timeout, result_dir) for job in agent_jobs]
         for future in as_completed(futures):
             rows.append(future.result())
+
+    retried_labels = []
+    by_title = {summary.get("session_title"): (sid, path, summary) for sid, path, summary in rows}
+    for label, _cmd in agents:
+        title = f"fusion-{label}-{run_id}"
+        row = by_title.get(title)
+        if row is None or not auth_error_needs_proxy_retry(label, row[2]):
+            continue
+        if args.base_session:
+            retry_session, retry_args = fork_launch_args(
+                args.base_session,
+                args.workdir,
+                rollback_forks,
+                invocation_info.get("latest_prompt", ""),
+                title,
+            )
+        else:
+            retry_session, retry_args = new_session_launch_args()
+        fork_session_ids[label] = retry_session
+        retry_job = make_headless_job(
+            label,
+            agent_commands[label],
+            title,
+            topic,
+            args.workdir,
+            retry_session,
+            retry_args,
+            system_prompt,
+            env=proxy_retry_env(),
+            env_unset=["ANTHROPIC_AUTH_TOKEN"],
+            extra_args=["--model", "opus"],
+            fallback="proxy-auth-retry",
+        )
+        retry_row = run_headless_agent(retry_job, args.timeout, result_dir)
+        by_title[title] = retry_row
+        retried_labels.append(label)
+    rows = list(by_title.values())
 
     expected = {f"fusion-{label}-{run_id}" for label, _ in agents}
     completed = completed_titles(rows)
@@ -817,6 +894,7 @@ def main():
         "source_session_prompt": compact(invocation_info.get("source_prompt", ""), 1200),
         "history_latest_prompt": compact(invocation_info.get("history_prompt", ""), 1200),
         "fork_session_ids": fork_session_ids,
+        "retried_labels": retried_labels,
         "agent_results": [
             {
                 "session_id": sid,
