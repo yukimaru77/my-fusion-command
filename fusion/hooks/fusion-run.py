@@ -688,21 +688,24 @@ def collect_by_title(run_id, agents, timeout_s, session_name=None, topic=None, m
             if current is None or summary_path.stat().st_mtime > current[1].stat().st_mtime:
                 by_title[title] = candidate
         rows = list(by_title.values())
-        if session_name and topic:
-            existing = {summary.get("session_title") for _, _, summary in rows}
+        if topic:
+            existing = {
+                summary.get("session_title")
+                for _, _, summary in rows
+                if summary_is_complete(summary)
+            }
             for row in collect_from_fork_transcripts(fork_session_ids, agents, topic, expected - existing):
-                if row[2].get("session_title") not in existing:
-                    rows.append(row)
-                    existing.add(row[2].get("session_title"))
-            for row in collect_from_panes(session_name, agents, topic, expected - existing, marker_topic or topic):
-                if row[2].get("session_title") not in existing:
-                    rows.append(row)
+                rows = replace_row_by_title(rows, row)
+                existing.add(row[2].get("session_title"))
+            if session_name:
+                for row in collect_from_panes(session_name, agents, topic, expected - existing, marker_topic or topic):
+                    rows = replace_row_by_title(rows, row)
                     existing.add(row[2].get("session_title"))
         last_rows = rows
         complete = {
             summary.get("session_title")
             for _, _, summary in rows
-            if len(summary.get("stops") or []) >= 1 and (summary.get("last_assistant") or "").strip()
+            if summary_is_complete(summary)
         }
         if expected <= complete:
             return rows
@@ -721,8 +724,17 @@ def completed_titles(rows):
     return {
         summary.get("session_title")
         for _, _, summary in rows
-        if len(summary.get("stops") or []) >= 1 and (summary.get("last_assistant") or "").strip()
+        if summary_is_complete(summary)
     }
+
+
+def summary_is_complete(summary):
+    return len(summary.get("stops") or []) >= 1 and bool((summary.get("last_assistant") or "").strip())
+
+
+def replace_row_by_title(rows, row):
+    title = row[2].get("session_title")
+    return [item for item in rows if item[2].get("session_title") != title] + [row]
 
 
 def assistant_text(row):
@@ -989,14 +1001,13 @@ def main():
     expected = {f"fusion-{label}-{run_id}" for label, _ in agents}
     completed = completed_titles(rows)
     if completed != expected:
-        existing = {summary.get("session_title") for _, _, summary in rows}
+        existing = completed_titles(rows)
         for row in collect_from_fork_transcripts(fork_session_ids, agents, topic, expected - existing):
-            if row[2].get("session_title") not in existing:
-                rows.append(row)
-                existing.add(row[2].get("session_title"))
+            rows = replace_row_by_title(rows, row)
+            existing.add(row[2].get("session_title"))
         for row in collect_from_panes(session_name, agents, topic, expected - existing):
-            if row[2].get("session_title") not in existing:
-                rows.append(row)
+            rows = replace_row_by_title(rows, row)
+            existing.add(row[2].get("session_title"))
         completed = completed_titles(rows)
     missing = expected - completed
 
