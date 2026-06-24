@@ -1323,6 +1323,16 @@ def cleanup_run_sessions(spec, output_json=False):
     return 0
 
 
+def refuse_nested_fusion():
+    message = (
+        "Fusion is disabled inside fusion child agents. "
+        "You are already one of the fusion agents; do not call /fusion or fusion-run.py. "
+        "Answer the user's prompt directly by yourself."
+    )
+    print(message)
+    return 0
+
+
 def assistant_text(row):
     message = row.get("message")
     if not isinstance(message, dict):
@@ -1418,6 +1428,8 @@ def main():
         return show_status(args.status, args.json)
     if args.cleanup_sessions is not None:
         return cleanup_run_sessions(args.cleanup_sessions, args.json)
+    if os.environ.get("CLAUDE_FUSION_CHILD") == "1":
+        return refuse_nested_fusion()
 
     topic = " ".join(args.topic).strip()
     if not topic:

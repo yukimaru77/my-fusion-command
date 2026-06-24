@@ -23,6 +23,7 @@ claude-glm    # GLM through CC Switch provider settings
 - `/fusion` は直接 slash command から呼ばれた場合、子 fork に `/fusion` command row を残さない。JSONL 内の `/fusion` command row を探し、その `parentUuid` 側の checkpoint まで Claude Agent SDK の `forkSession(..., { upToMessageId })` で切り詰める。
 - skill / 親エージェント経由の `/fusion` は rollback しない。代わりに子 fork へ「すでに fusion エージェントの一員なので再fusionせず自分で回答する」system prompt を追加する。
 - 子 fork では一時 `CLAUDE_CONFIG_DIR` を使い、`/fusion` command と fusion 系 skill だけを除外する。全skillsを落とす `--disable-slash-commands` は使わない。
+- 子 fork は `CLAUDE_FUSION_CHILD=1` で起動する。子が Bash から `fusion-run.py` を直叩きしても runtime guard が即時拒否し、再帰的な fusion 起動を防ぐ。
 - 子 fork の Claude session 履歴は回答回収後にデフォルト削除する。削除対象は `~/.claude/projects/**/*.jsonl` と `~/.claude/tasks/<session-id>`。デバッグで残す場合だけ `--keep-child-sessions` を使う。
 - `/fusion` の transcript capture は opt-in で、`CLAUDE_TRANSCRIPT_CAPTURE=1` または `~/.claude/session-captures/enabled` がある時だけ保存する。
 - 確認コマンドで secret を表示しない。`settings_config` 全体をそのまま出力しない。
@@ -196,6 +197,7 @@ sqlite3 ~/.cc-switch/cc-switch.db \
 - run id と child session id は毎回新規生成する。base session がない場合も `--session-id` を明示し、前回の `/fusion` child session を次回に再利用しない。
 - headless の official `claude` が `Not logged in` / `authentication_failed` で失敗した場合だけ、他 agent 完了後に CC Switch proxy env (`ANTHROPIC_BASE_URL=http://127.0.0.1:15721`, `ANTHROPIC_API_KEY=PROXY_MANAGED`) で `claude` を再試行する。proxy を使う codex との current provider 競合を避けるため、fallback は初回並列実行後に単独で実行する。
 - 子 fork は fusion-filtered `CLAUDE_CONFIG_DIR` と `--append-system-prompt` 付きで起動する。direct `/fusion` では `/fusion` 自体が履歴に残らない状態で prompt だけを送る。
+- `CLAUDE_FUSION_CHILD=1` の通常実行は拒否する。`--status` と `--cleanup-sessions` は監視・掃除用として子環境でも許可する。
 - fork の対応付けは prompt 内タグではなく `--name fusion-<agent>-<run_id>` と child session id で行う。
 - `~/.claude/projects/**/*.jsonl` は rollback 検証に使う。回答収集は headless 実行の stream-json result を優先する。
 - 回答収集と judge prompt 作成後、child session id に対応する Claude履歴を削除する。`manifest.json` には削除対象session id、削除path、エラーを残す。
