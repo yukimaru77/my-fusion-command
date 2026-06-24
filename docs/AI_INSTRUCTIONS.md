@@ -10,7 +10,7 @@ claude-codex  # Codex OAuth through CC Switch
 claude-glm    # GLM through CC Switch provider settings
 ```
 
-加えて、Claude Code の `/fusion` slash command を入れます。`/fusion <お題>` は3 provider を tmux で並列 fork し、hook で prompt/tool input/tool output/final answer を収集し、main セッションで批判的に統合するための judge prompt を生成します。
+加えて、Claude Code の `/fusion` slash command を入れます。`/fusion <お題>` は3 provider を Claude Agent SDK で fork し、tmux で並列起動し、hook と JSONL fallback で final answer を収集し、main セッションで批判的に統合するための judge prompt を生成します。
 
 ## 守ること
 
@@ -20,6 +20,8 @@ claude-glm    # GLM through CC Switch provider settings
 - ユーザーの unrelated git changes は戻さない。
 - `~/.claude/settings.json` を恒久的に Codex/GLM へ書き換えない。
 - `/fusion` 用 hooks は既存 hooks に追記する。既存の hooks/permissions/env を置き換えない。
+- `/fusion` は直接 slash command から呼ばれた場合、子 fork に `/fusion` command row を残さない。JSONL 内の `/fusion` command row を探し、その `parentUuid` 側の checkpoint まで Claude Agent SDK の `forkSession(..., { upToMessageId })` で切り詰める。
+- skill / 親エージェント経由の `/fusion` は rollback しない。代わりに子 fork へ「すでに fusion エージェントの一員なので再fusionせず自分で回答する」system prompt を追加する。
 - `/fusion` の transcript capture は opt-in で、`CLAUDE_TRANSCRIPT_CAPTURE=1` または `~/.claude/session-captures/enabled` がある時だけ保存する。
 - 確認コマンドで secret を表示しない。`settings_config` 全体をそのまま出力しない。
 
@@ -57,7 +59,7 @@ provider ID が環境で違うだけなら、`bin/ccswitch-claude-run.template` 
 1. Claude Code がインストール済み。
 2. CC Switch がセットアップ済み。
 3. `jq`, `sqlite3`, `lsof` が利用可能。
-4. `/fusion` を使うなら `tmux` と `python3` が利用可能。
+4. `/fusion` を使うなら `tmux`, `python3`, Node.js/npm が利用可能。
 5. `~/.cc-switch/cc-switch.db` が存在する。
 6. CC Switch DB に以下の provider が存在する。
    - `default`
@@ -100,6 +102,8 @@ hash -r
 ```bash
 bash -n bin/claude bin/claude-codex bin/claude-glm bin/ccswitch-claude-run.template install.sh
 python3 -m py_compile fusion/hooks/collect-transcript.py fusion/hooks/capture-query.py fusion/hooks/fusion-run.py
+npm install --prefix fusion/fusion-sdk --omit=dev
+node fusion/hooks/fusion-sdk-fork.mjs || test $? -eq 2
 ```
 
 コマンド確認:
@@ -182,7 +186,10 @@ sqlite3 ~/.cc-switch/cc-switch.db \
 - `ccswitch-claude-run` は install 時に `bin/ccswitch-claude-run.template` から生成される。
 - Codex は `ANTHROPIC_BASE_URL=http://127.0.0.1:15721` と `ANTHROPIC_API_KEY=PROXY_MANAGED` を使う。
 - GLM は CC Switch DB の `zai-glm` provider から `ANTHROPIC_BASE_URL`, `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_MODEL` を読む。
-- `/fusion` は `fusion/commands/fusion.md` と `fusion/hooks/*.py` を `~/.claude` へインストールする。
-- `/fusion` は `tmux` 上で `claude` / `claude-codex` / `claude-glm` を `--continue --fork-session` で起動する。
+- `/fusion` は `fusion/commands/fusion.md`, `fusion/hooks/*.py`, `fusion/hooks/*.mjs`, `fusion/fusion-sdk/package.json` を `~/.claude` へインストールする。
+- install 時に `~/.claude/fusion-sdk` へ `@anthropic-ai/claude-agent-sdk` を npm install する。
+- `/fusion` は `fusion-sdk-fork.mjs` 経由で `forkSession` を呼び、必要なら `upToMessageId` を渡して元セッションを切り詰めた新セッションを作る。
+- `/fusion` は `tmux` 上で `claude` / `claude-codex` / `claude-glm` を `--resume <fork-session-id>` で起動する。TUI 側の `--fork-session` / `--resume-session-at` には依存しない。
+- 子 fork は `--disable-slash-commands` と `--append-system-prompt` 付きで起動する。direct `/fusion` では `/fusion` 自体が履歴に残らない状態で prompt だけを送る。
 - fork の対応付けは prompt 内タグではなく `--name fusion-<agent>-<run_id>` と hook payload の `session_title` で行う。
-- `~/.claude/projects/**/*.jsonl` は存在すれば補助的にコピーするが、fork/ラッパー環境では無い場合があるため、正本は `~/.claude/session-captures/<session_id>/hook-events.jsonl` と `summary.json`。
+- `~/.claude/projects/**/*.jsonl` は回答収集の fallback と rollback 検証に使う。hook capture が不完全な場合でも fork session id から JSONL を読んで最後の assistant answer を回収する。

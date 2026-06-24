@@ -67,11 +67,19 @@ sed "s|@CC_SWITCH_BIN@|$escaped_bin|g" \
 chmod 755 "$bin_dir/ccswitch-claude-run"
 
 if [ "$install_fusion" != "0" ]; then
-  mkdir -p "$claude_dir/hooks" "$claude_dir/commands"
+  mkdir -p "$claude_dir/hooks" "$claude_dir/commands" "$claude_dir/fusion-sdk"
   install_mode_755 "$repo_root/fusion/hooks/collect-transcript.py" "$claude_dir/hooks/collect-transcript.py"
   install_mode_755 "$repo_root/fusion/hooks/capture-query.py" "$claude_dir/hooks/capture-query.py"
   install_mode_755 "$repo_root/fusion/hooks/fusion-run.py" "$claude_dir/hooks/fusion-run.py"
+  install_mode_755 "$repo_root/fusion/hooks/fusion-sdk-fork.mjs" "$claude_dir/hooks/fusion-sdk-fork.mjs"
   install -m 644 "$repo_root/fusion/commands/fusion.md" "$claude_dir/commands/fusion.md"
+  install -m 644 "$repo_root/fusion/fusion-sdk/package.json" "$claude_dir/fusion-sdk/package.json"
+
+  if ! command -v npm >/dev/null 2>&1; then
+    echo "npm is required to install @anthropic-ai/claude-agent-sdk for /fusion rollback." >&2
+    exit 69
+  fi
+  npm install --prefix "$claude_dir/fusion-sdk" --omit=dev >/dev/null
 
   CLAUDE_FUSION_HOOK_PATH="$claude_dir/hooks/collect-transcript.py" python3 - "$claude_dir/settings.json" <<'PY'
 import json
@@ -128,6 +136,9 @@ if [ "$install_fusion" != "0" ]; then
 
 Fusion command installed into:
   $claude_dir
+
+Fusion SDK dependency installed into:
+  $claude_dir/fusion-sdk
 
 Fusion usage:
   /fusion <topic>

@@ -4,7 +4,9 @@ argument-hint: <prompt>
 allowed-tools: Bash, Read
 ---
 
-Run the fusion harness for this topic:
+Run the fusion harness for this topic using exactly one Bash tool call.
+Set the Bash tool timeout to at least 600000 ms. Do not use Agent, Task, background agents, WebSearch, or any fallback fusion path.
+If the Bash call times out or fails, report that failure and do not synthesize an answer from any other mechanism.
 
 ```bash
 ~/.claude/hooks/fusion-run.py "$ARGUMENTS"

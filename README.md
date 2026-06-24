@@ -12,14 +12,35 @@ Claude Code 用の `/fusion` スラッシュコマンドです。
 
 内部の流れ:
 
-1. tmux 上で複数の Claude Code セッションを並列起動（デフォルト: Claude / Codex / GLM）
-2. 各モデルが独立にプロンプトへ回答
-3. hook が各セッションの回答と tool 使用履歴を収集
-4. メインセッションが全回答を読み、統合された最終回答を出力
+1. 現在の Claude Code セッションを Claude Agent SDK で3つ fork（デフォルト: Claude / Codex / GLM）
+2. 直接 `/fusion <prompt>` から起動された場合だけ、子 fork は `/fusion` の1ターン前へ rollback
+3. 子 fork に slash command を無効化した状態で `<prompt>` だけを入力
+4. 各モデルが独立に回答し、hook と JSONL fallback で回答を収集
+5. メインセッションが全回答を読み、統合された最終回答を出力
 
 ユーザーに見えるのは最終回答だけです。複数モデルの視点を経ることで、単一モデルの盲点を補います。
 
-**注意**: このハーネスは Claude Code 専用です。各エージェントは Claude Code の `--fork-session` と hook 機構に依存しており、他の AI クライアントでは動作しません。
+**注意**: このハーネスは Claude Code 専用です。fork は `@anthropic-ai/claude-agent-sdk` の `forkSession` と Claude Code の hook / JSONL 履歴に依存しており、他の AI クライアントでは動作しません。
+
+## rollback の仕様
+
+`/fusion` は Claude Code の slash command なので、普通に fork すると子セッションにも `/fusion` 呼び出しが入ります。このリポジトリの実装では、直接 `/fusion <prompt>` が叩かれた場合に限り、JSONL 内の `/fusion` command row を探して、その直前の checkpoint まで fork を切り詰めます。
+
+そのため、子 fork の実ユーザー履歴は次のようになります。
+
+```text
+こんにちは
+/fusion 1年で1億稼ぐアプリを作るには何を作ればいい？
+```
+
+ではなく:
+
+```text
+こんにちは
+1年で1億稼ぐアプリを作るには何を作ればいい？
+```
+
+skill や親エージェント経由で `/fusion` が呼ばれた場合は rollback しません。その代わり、子 fork には「あなたはすでに fusion エージェントの一員なので、再fusionせず自分で直接回答する」system prompt を追加します。
 
 ## エージェントのカスタマイズ
 
@@ -54,6 +75,7 @@ Claude Code 用の `/fusion` スラッシュコマンドです。
 
 - macOS または Linux
 - Claude Code
+- Node.js / npm
 - `tmux`, `python3`, `jq`, `sqlite3`, `lsof`
 - `~/.local/bin` が `PATH` に入っていること
 - **[ccswitch-claude-codex-setup](https://github.com/yukimaru77/ccswitch-claude-codex-setup)** を先にセットアップしてください
@@ -89,6 +111,17 @@ Claude Code のセッション内で:
 /fusion 設計についてどう思う？
 ```
 
+実行中は tmux セッション `fusion-<run_id>` が作られます。デフォルトでは `claude` / `codex` / `glm` が tmux window として並びます。
+
+```text
+Ctrl-b n    次の window
+Ctrl-b p    前の window
+Ctrl-b 0    claude
+Ctrl-b 1    codex
+Ctrl-b 2    glm
+Ctrl-b w    window 一覧
+```
+
 ## 動作確認
 
 ```bash
@@ -97,5 +130,11 @@ type claude claude-codex claude-glm
 
 # /fusion 関連ファイル
 test -x ~/.claude/hooks/fusion-run.py && echo ok
+test -x ~/.claude/hooks/fusion-sdk-fork.mjs && echo ok
 test -f ~/.claude/commands/fusion.md && echo ok
+test -d ~/.claude/fusion-sdk/node_modules/@anthropic-ai/claude-agent-sdk && echo ok
+
+# 構文チェック
+python3 -m py_compile ~/.claude/hooks/fusion-run.py
+node ~/.claude/hooks/fusion-sdk-fork.mjs || test $? -eq 2
 ```
