@@ -10,7 +10,7 @@ claude-codex  # Codex OAuth through CC Switch
 claude-glm    # GLM through CC Switch provider settings
 ```
 
-加えて、Claude Code の `/fusion` slash command を入れます。`/fusion <お題>` は3 provider を Claude Agent SDK で fork し、tmux で並列起動し、hook と JSONL fallback で final answer を収集し、main セッションで批判的に統合するための judge prompt を生成します。
+加えて、Claude Code の `/fusion` slash command を入れます。`/fusion <お題>` は3 provider を Claude Agent SDK で fork し、headless print mode で並列起動し、stream-json から final answer を収集し、main セッションで批判的に統合するための judge prompt を生成します。
 
 ## 守ること
 
@@ -59,7 +59,7 @@ provider ID が環境で違うだけなら、`bin/ccswitch-claude-run.template` 
 1. Claude Code がインストール済み。
 2. CC Switch がセットアップ済み。
 3. `jq`, `sqlite3`, `lsof` が利用可能。
-4. `/fusion` を使うなら `tmux`, `python3`, Node.js/npm が利用可能。
+4. `/fusion` を使うなら `python3`, Node.js/npm が利用可能。
 5. `~/.cc-switch/cc-switch.db` が存在する。
 6. CC Switch DB に以下の provider が存在する。
    - `default`
@@ -189,9 +189,9 @@ sqlite3 ~/.cc-switch/cc-switch.db \
 - `/fusion` は `fusion/commands/fusion.md`, `fusion/hooks/*.py`, `fusion/hooks/*.mjs`, `fusion/fusion-sdk/package.json` を `~/.claude` へインストールする。
 - install 時に `~/.claude/fusion-sdk` へ `@anthropic-ai/claude-agent-sdk` を npm install する。
 - `/fusion` は `fusion-sdk-fork.mjs` 経由で `forkSession` を呼び、必要なら `upToMessageId` を渡して元セッションを切り詰めた新セッションを作る。
-- `/fusion` は `tmux` 上で `claude` / `claude-codex` / `claude-glm` を `--resume <fork-session-id>` で起動する。TUI 側の `--fork-session` / `--resume-session-at` には依存しない。
+- `/fusion` は `claude` / `claude-codex` / `claude-glm` を `-p --output-format stream-json --verbose` で headless 並列起動する。TUI 側の `--fork-session` / `--resume-session-at` には依存しない。
 - `/fusion` の収集 timeout はデフォルト120分。`fusion/commands/fusion.md` 側でも Bash tool timeout を120分以上に指定し、`fusion-run.py --timeout 7200` を呼ぶ。
-- 全エージェントの回答回収が完了した run は tmux session を即時削除する。回答を取りこぼした run は調査用に tmux session を残すが、run id と child session id は毎回新規生成し、残った tmux session を次回の `/fusion` で再利用しない。
+- run id と child session id は毎回新規生成する。base session がない場合も `--session-id` を明示し、前回の `/fusion` child session を次回に再利用しない。
 - 子 fork は `--disable-slash-commands` と `--append-system-prompt` 付きで起動する。direct `/fusion` では `/fusion` 自体が履歴に残らない状態で prompt だけを送る。
-- fork の対応付けは prompt 内タグではなく `--name fusion-<agent>-<run_id>` と hook payload の `session_title` で行う。
-- `~/.claude/projects/**/*.jsonl` は回答収集の fallback と rollback 検証に使う。hook capture が不完全な場合でも fork session id から JSONL を読んで最後の assistant answer を回収する。
+- fork の対応付けは prompt 内タグではなく `--name fusion-<agent>-<run_id>` と child session id で行う。
+- `~/.claude/projects/**/*.jsonl` は rollback 検証に使う。回答収集は headless 実行の stream-json result を優先する。

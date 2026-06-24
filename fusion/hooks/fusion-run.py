@@ -3,10 +3,12 @@ import argparse
 import json
 import os
 import re
+import signal
 import shlex
 import subprocess
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 HOME = Path.home()
@@ -48,23 +50,6 @@ def run(cmd, check=True):
     if check and result.returncode != 0:
         raise RuntimeError(f"command failed: {shlex.join(cmd)}\nstdout={result.stdout}\nstderr={result.stderr}")
     return result
-
-
-def tmux(*args, check=True):
-    return run(["tmux", *args], check=check)
-
-
-def cmux(*args, check=True):
-    return run(["cmux", *args], check=check)
-
-
-def cleanup_tmux_session(session_name, keep_session, capture_complete):
-    if keep_session:
-        return False, "keep-session"
-    if not capture_complete:
-        return False, "incomplete-capture"
-    tmux("kill-session", "-t", session_name, check=False)
-    return True, ""
 
 
 def unique_run_id():
@@ -514,203 +499,128 @@ def fork_launch_args(base_session, workdir, rollback_to_previous_turn, rollback_
     return new_sid, ["--resume", new_sid]
 
 
-def pane_text(session_name, idx):
-    result = tmux("capture-pane", "-t", f"{session_name}:{idx}", "-p", "-S", "-", check=False)
-    return result.stdout or ""
-
-
-def pane_tail(session_name, idx, lines=50):
-    return "\n".join(pane_text(session_name, idx).splitlines()[-lines:])
-
-
-def pane_has_prompt(text):
-    return any(re.match(r"^\s*❯", line) for line in (text or "").splitlines())
-
-
-def pane_is_idle(session_name, idx, title):
-    tail = pane_tail(session_name, idx)
-    return pane_has_prompt(tail)
-
-
-def pane_is_busy(session_name, idx, title):
-    tail = pane_tail(session_name, idx)
-    return not pane_has_prompt(tail) and "esc to interrupt" in tail
-
-
-def wait_for_ready(session_name, idx, title, timeout_s, cancel_startup=False):
-    deadline = time.time() + timeout_s
-    stable_since = None
-    cancelled_startup = False
-    while time.time() < deadline:
-        if cancel_startup and not cancelled_startup and pane_is_busy(session_name, idx, title):
-            tmux("send-keys", "-t", f"{session_name}:{idx}", "C-c", check=False)
-            cancelled_startup = True
-            stable_since = None
-            time.sleep(1)
+def stream_json_answer(stdout):
+    answer = ""
+    session_id = ""
+    result_payload = None
+    json_errors = 0
+    for line in (stdout or "").splitlines():
+        if not line.strip():
             continue
-        if pane_is_idle(session_name, idx, title):
-            if stable_since is None:
-                stable_since = time.time()
-            elif time.time() - stable_since >= 3:
-                return True
-        else:
-            stable_since = None
-        time.sleep(0.5)
-    return False
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError:
+            json_errors += 1
+            continue
+        if not isinstance(row, dict):
+            continue
+        if isinstance(row.get("session_id"), str):
+            session_id = row["session_id"]
+        if row.get("type") == "assistant":
+            text = assistant_text(row)
+            if text:
+                answer = text
+        elif row.get("type") == "result":
+            result_payload = row
+            result_text = row.get("result")
+            if isinstance(result_text, str) and result_text.strip():
+                answer = result_text
+    return answer.strip(), session_id, result_payload, json_errors
 
 
-def wait_for_titles(session_name, agents, run_id, timeout_s):
-    deadline = time.time() + timeout_s
-    pending = {idx: f"fusion-{label}-{run_id}" for idx, (label, _) in enumerate(agents)}
-    while pending and time.time() < deadline:
-        for idx, title in list(pending.items()):
-            if title in pane_text(session_name, idx):
-                del pending[idx]
-        if pending:
-            time.sleep(0.5)
-    return not pending
-
-
-def wait_for_all_ready(session_name, agents, run_id, timeout_s):
-    for idx, (label, _) in enumerate(agents):
-        title = f"fusion-{label}-{run_id}"
-        if not wait_for_ready(session_name, idx, title, timeout_s, cancel_startup=True):
-            return False
-    return True
-
-
-def send_prompt(session_name, idx, prompt):
-    target = f"{session_name}:{idx}"
-    tmux("send-keys", "-t", target, "-l", prompt)
-    tmux("send-keys", "-t", target, "C-m")
-
-
-def parse_ref(text, prefix):
-    match = re.search(rf"\b{re.escape(prefix)}:\d+\b", text or "")
-    return match.group(0) if match else ""
-
-
-def cmux_current_workspace():
-    result = cmux("identify", "--json", check=False)
-    if result.returncode != 0 or not result.stdout.strip():
-        return ""
-    try:
-        payload = json.loads(result.stdout)
-    except Exception:
-        return ""
-    caller = payload.get("caller") or {}
-    focused = payload.get("focused") or {}
-    return caller.get("workspace_ref") or focused.get("workspace_ref") or ""
-
-
-def cmux_new_terminal_pane(workspace):
-    commands = [
-        ["new-pane", "--type", "terminal", "--direction", "down", "--workspace", workspace, "--focus", "true"],
-        ["new-split", "down", "--workspace", workspace, "--focus", "true"],
-        ["new-surface", "--type", "terminal", "--workspace", workspace, "--focus", "true"],
-    ]
-    for command in commands:
-        result = cmux(*command, check=False)
-        if result.returncode == 0:
-            return result.stdout + result.stderr
+def process_error_text(returncode, stderr, result_payload, timed_out):
+    if timed_out:
+        return "timed out"
+    if isinstance(result_payload, dict) and result_payload.get("is_error"):
+        errors = result_payload.get("errors")
+        if isinstance(errors, list) and errors:
+            return "; ".join(str(item) for item in errors)
+        result = result_payload.get("result")
+        if isinstance(result, str) and result.strip():
+            return result.strip()
+        subtype = result_payload.get("subtype")
+        return f"Claude Code returned error result: {subtype or 'unknown'}"
+    if returncode != 0:
+        detail = (stderr or "").strip()
+        return detail or f"process exited with {returncode}"
     return ""
 
 
-def cmux_focused_surface():
-    result = cmux("identify", "--json", check=False)
-    if result.returncode != 0 or not result.stdout.strip():
-        return ""
+def terminate_process_group(proc):
     try:
-        payload = json.loads(result.stdout)
+        os.killpg(proc.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
     except Exception:
-        return ""
-    focused = payload.get("focused") or {}
-    return focused.get("surface_ref") or ""
+        proc.terminate()
+    try:
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except Exception:
+            proc.kill()
 
 
-def open_cmux_tmux_monitor(session_name):
-    workspace = cmux_current_workspace()
-    if not workspace:
-        return ""
+def run_headless_agent(agent, timeout_s, result_dir):
+    label = agent["label"]
+    stdout_path = result_dir / f"{label}.stdout.jsonl"
+    stderr_path = result_dir / f"{label}.stderr.txt"
+    summary_path = result_dir / f"{label}.summary.json"
+    started = time.time()
+    timed_out = False
+    stdout = ""
+    stderr = ""
+    returncode = 1
+    try:
+        proc = subprocess.Popen(
+            agent["argv"],
+            cwd=agent["workdir"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=os.environ.copy(),
+            start_new_session=True,
+        )
+        try:
+            stdout, stderr = proc.communicate(timeout=timeout_s)
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            terminate_process_group(proc)
+            stdout, stderr = proc.communicate()
+        returncode = proc.returncode if proc.returncode is not None else -1
+    except FileNotFoundError as exc:
+        stderr = str(exc)
+        returncode = 127
+    except Exception as exc:
+        stderr = str(exc)
+        returncode = 1
 
-    output = cmux_new_terminal_pane(workspace)
-    surface = parse_ref(output, "surface") or cmux_focused_surface()
-    command = f"tmux attach -t {shlex.quote(session_name)}"
-    if surface:
-        cmux("send", "--surface", surface, command, check=False)
-        cmux("send-key", "--surface", surface, "Enter", check=False)
-        cmux("rename-tab", "--surface", surface, f"fusion {session_name}", check=False)
-        cmux("trigger-flash", "--surface", surface, check=False)
-        return surface
+    stdout_path.write_text(stdout or "", encoding="utf-8")
+    stderr_path.write_text(stderr or "", encoding="utf-8")
 
-    cmux("send", command, check=False)
-    cmux("send-key", "Enter", check=False)
-    return "focused"
-
-
-def collect_by_title(run_id, agents, timeout_s, session_name=None, topic=None, marker_topic=None, fork_session_ids=None):
-    expected = {f"fusion-{label}-{run_id}" for label, _ in agents}
-    deadline = time.time() + timeout_s
-    last_rows = []
-    while time.time() < deadline:
-        by_title = {}
-        for summary_path in CAPTURE_ROOT.glob("*/summary.json"):
-            try:
-                summary = json.loads(summary_path.read_text())
-            except Exception:
-                continue
-            title = summary.get("session_title") or ""
-            if title not in expected:
-                continue
-            if marker_topic and not summary_has_prompt(summary, marker_topic):
-                continue
-            candidate = (summary_path.parent.name, summary_path, summary)
-            current = by_title.get(title)
-            if current is None or summary_path.stat().st_mtime > current[1].stat().st_mtime:
-                by_title[title] = candidate
-        rows = list(by_title.values())
-        if topic:
-            idle_titles = set()
-            if session_name:
-                for idx, (label, _) in enumerate(agents):
-                    title = f"fusion-{label}-{run_id}"
-                    if pane_is_idle(session_name, idx, title):
-                        idle_titles.add(title)
-            existing = {
-                summary.get("session_title")
-                for _, _, summary in rows
-                if summary_is_complete(summary)
-            }
-            for row in collect_from_fork_transcripts(
-                fork_session_ids,
-                agents,
-                topic,
-                expected - existing,
-                idle_titles=idle_titles,
-            ):
-                rows = replace_row_by_title(rows, row)
-                existing.add(row[2].get("session_title"))
-            if session_name:
-                for row in collect_from_panes(session_name, agents, topic, expected - existing, marker_topic or topic):
-                    rows = replace_row_by_title(rows, row)
-                    existing.add(row[2].get("session_title"))
-        last_rows = rows
-        complete = {
-            summary.get("session_title")
-            for _, _, summary in rows
-            if summary_is_complete(summary)
-        }
-        if expected <= complete:
-            return rows
-        time.sleep(1)
-    return last_rows
-
-
-def summary_has_prompt(summary, prompt):
-    for item in summary.get("prompts") or []:
-        if (item.get("prompt") or "") == prompt:
-            return True
-    return False
+    answer, observed_session_id, result_payload, json_errors = stream_json_answer(stdout)
+    error = process_error_text(returncode, stderr, result_payload, timed_out)
+    complete = returncode == 0 and not error and bool(answer)
+    duration_ms = int((time.time() - started) * 1000)
+    summary = {
+        "session_title": agent["title"],
+        "prompts": [{"prompt": agent["topic"]}],
+        "last_assistant": answer,
+        "complete": complete,
+        "stops": [{"event": "HeadlessPrint", "returncode": returncode}],
+        "error": error,
+        "timed_out": timed_out,
+        "json_errors": json_errors,
+        "duration_ms": duration_ms,
+        "session_id": observed_session_id or agent["session_id"],
+        "argv": agent["argv"],
+        "stdout_path": str(stdout_path),
+        "stderr_path": str(stderr_path),
+    }
+    summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    return (agent["session_id"], summary_path, summary)
 
 
 def completed_titles(rows):
@@ -729,11 +639,6 @@ def summary_is_complete(summary):
     return summary.get("complete") is True or len(summary.get("stops") or []) >= 1
 
 
-def replace_row_by_title(rows, row):
-    title = row[2].get("session_title")
-    return [item for item in rows if item[2].get("session_title") != title] + [row]
-
-
 def assistant_text(row):
     message = row.get("message")
     if not isinstance(message, dict):
@@ -750,121 +655,6 @@ def assistant_text(row):
         if block.get("type") == "text" and isinstance(block.get("text"), str):
             parts.append(block["text"])
     return "\n".join(parts).strip()
-
-
-def prompt_matches(row, topic):
-    if not is_human_prompt(row):
-        return False
-    return command_prompt_text(human_prompt_text(row)).strip() == topic.strip()
-
-
-def latest_final_assistant_after_prompt(session_id, topic, allow_open_stop=False):
-    transcript = find_new_transcript(claude_config_root(), session_id)
-    if transcript is None:
-        return "", ""
-    rows = read_jsonl(transcript)
-    after_prompt = False
-    last_final = ""
-    last_open_stop = ""
-    for row in rows:
-        if row.get("sessionId") != session_id:
-            continue
-        if prompt_matches(row, topic):
-            after_prompt = True
-            last_final = ""
-            last_open_stop = ""
-            continue
-        if after_prompt and row.get("type") == "assistant":
-            text = assistant_text(row)
-            stop_reason = (row.get("message") or {}).get("stop_reason")
-            if text and stop_reason == "end_turn":
-                last_final = text
-            elif text and allow_open_stop and not stop_reason:
-                last_open_stop = text
-    return (last_final or last_open_stop).strip(), str(transcript)
-
-
-def collect_from_fork_transcripts(fork_session_ids, agents, topic, titles, idle_titles=None):
-    rows = []
-    if not fork_session_ids:
-        return rows
-    idle_titles = idle_titles or set()
-    for label, _cmd in agents:
-        expected_title = next((item for item in titles if item.startswith(f"fusion-{label}-")), "")
-        if not expected_title:
-            continue
-        session_id = fork_session_ids.get(label)
-        if not session_id:
-            continue
-        answer, path = latest_final_assistant_after_prompt(
-            session_id,
-            topic,
-            allow_open_stop=expected_title in idle_titles,
-        )
-        if not answer:
-            continue
-        rows.append((
-            session_id,
-            path,
-            {
-                "session_title": expected_title,
-                "prompts": [{"prompt": topic}],
-                "last_assistant": answer,
-                "complete": True,
-                "stops": [{"event": "TranscriptFallback"}],
-            },
-        ))
-    return rows
-
-
-def extract_last_assistant_from_pane(text, topic):
-    marker = f"❯ {topic}"
-    start = text.rfind(marker)
-    segment = text[start + len(marker):] if start >= 0 else text
-    assistant_pos = segment.rfind("⏺")
-    if assistant_pos < 0:
-        return ""
-    answer = segment[assistant_pos + len("⏺"):]
-    lines = []
-    for raw in answer.splitlines():
-        line = raw.rstrip()
-        stripped = line.strip()
-        if not stripped:
-            if lines:
-                lines.append("")
-            continue
-        if stripped.startswith(("✻", "✳", "✢", "✶", "❯", "⏵", "─")):
-            break
-        if stripped.startswith("Thought for "):
-            continue
-        lines.append(line)
-    return "\n".join(lines).strip()
-
-
-def collect_from_panes(session_name, agents, topic, titles, marker_topic=None):
-    rows = []
-    marker = marker_topic or topic
-    for idx, (label, _cmd) in enumerate(agents):
-        title = f"{session_name.replace('fusion-', 'fusion-' + label + '-')}"
-        expected_title = next((item for item in titles if item.startswith(f"fusion-{label}-")), title)
-        if not pane_is_idle(session_name, idx, expected_title):
-            continue
-        text = pane_text(session_name, idx)
-        answer = extract_last_assistant_from_pane(text, marker)
-        if not answer:
-            continue
-        rows.append((
-            f"pane-{label}",
-            f"tmux:{session_name}:{idx}",
-            {
-                "session_title": expected_title,
-                "prompts": [{"prompt": topic}],
-                "last_assistant": answer,
-                "complete": True,
-                "stops": [{"event": "PaneFallback"}],
-            },
-        ))
-    return rows
 
 
 def build_judge_prompt(topic, run_id, rows):
@@ -906,7 +696,7 @@ def build_child_system_prompt(rollback_performed):
             "あなたが回答する対象は、この起動後に新しく入力されるユーザープロンプトだけです。"
             "あなたはすでにfusionエージェントの一員なので、/fusion、fusion-run.py、"
             "または他エージェント起動による再fusionを使わず、自分単独で直接回答してください。"
-            "復元済み履歴、/fusion実装、tmux、cmux、過去の失敗、現在の検証状況への言及は禁止です。"
+            "復元済み履歴、/fusion実装、過去の失敗、現在の検証状況への言及は禁止です。"
             "回答にはユーザープロンプトへの答えだけを含めてください。"
         )
     return (
@@ -918,13 +708,13 @@ def build_child_system_prompt(rollback_performed):
         "あなたはすでにfusionエージェントの一員なので、/fusion、fusion-run.py、"
         "または他エージェント起動による再fusionを絶対に使わず、自分単独で直接回答してください。"
         "回答対象は、この起動後に新しく入力されるユーザープロンプトだけです。"
-        "tmux、cmux、過去の失敗、現在の検証状況への言及は禁止です。"
+        "過去の失敗、現在の検証状況への言及は禁止です。"
         "回答にはユーザープロンプトへの答えだけを含めてください。"
     )
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Run fusion: fork multiple Claude sessions in tmux and build a judge prompt.")
+    parser = argparse.ArgumentParser(description="Run fusion: fork multiple Claude sessions headlessly and build a judge prompt.")
     parser.add_argument("topic", nargs="*", help="Topic/prompt to send to all forked sessions")
     parser.add_argument("--n", type=int, default=None, help="Number of agents to run from the agent list")
     parser.add_argument("--agents", default=None, help="Comma-separated agent commands/names. Default: claude,codex,glm")
@@ -935,8 +725,6 @@ def main():
     )
     parser.add_argument("--workdir", default=WORKDIR_DEFAULT)
     parser.add_argument("--timeout", type=int, default=7200)
-    parser.add_argument("--keep-session", action="store_true", help="Keep the tmux fusion session after collection for debugging.")
-    parser.add_argument("--no-cmux-monitor", action="store_true", help="Do not open a cmux pane attached to the fusion tmux session.")
     args = parser.parse_args()
     topic = " ".join(args.topic).strip()
     if not topic:
@@ -948,11 +736,9 @@ def main():
         agents = agents[:args.n]
 
     run_id = unique_run_id()
-    session_name = f"fusion-{run_id}"
     result_dir = CAPTURE_ROOT / f"fusion-run-{run_id}"
     result_dir.mkdir(parents=True, exist_ok=True)
     CAPTURE_ROOT.mkdir(parents=True, exist_ok=True)
-    ENABLE_FILE.touch()
 
     invocation_info = {}
     rollback_forks = False
@@ -965,7 +751,7 @@ def main():
     system_prompt = build_child_system_prompt(rollback_forks)
 
     fork_session_ids = {}
-    launches = []
+    agent_jobs = []
 
     for label, cmd in agents:
         title = f"fusion-{label}-{run_id}"
@@ -981,80 +767,45 @@ def main():
         else:
             resume_session, fork_args = new_session_launch_args()
         fork_session_ids[label] = resume_session
-        command_parts = [
-            "CLAUDE_TRANSCRIPT_CAPTURE=1",
-            cmd,
-            "--name", shlex.quote(title),
-            "--disable-slash-commands",
-            "--append-system-prompt", shlex.quote(system_prompt),
-        ]
-        command_parts.extend(shlex.quote(part) for part in fork_args)
-        command = " ".join(command_parts)
-        launches.append((label, title, command))
+        argv = (
+            shlex.split(cmd)
+            + [
+                "-p",
+                "--output-format", "stream-json",
+                "--verbose",
+                "--name", title,
+                "--disable-slash-commands",
+                "--append-system-prompt", system_prompt,
+            ]
+            + fork_args
+            + [topic]
+        )
+        agent_jobs.append({
+            "label": label,
+            "title": title,
+            "argv": argv,
+            "workdir": args.workdir,
+            "topic": topic,
+            "session_id": resume_session,
+        })
 
-    tmux("kill-session", "-t", session_name, check=False)
-    first_label, _, first_command = launches[0]
-    tmux("new-session", "-d", "-s", session_name, "-n", first_label, "-c", args.workdir, first_command)
-    for label, _title, command in launches[1:]:
-        tmux("new-window", "-t", f"{session_name}:", "-n", label, "-c", args.workdir, command)
+    rows = []
+    with ThreadPoolExecutor(max_workers=len(agent_jobs)) as executor:
+        futures = [executor.submit(run_headless_agent, job, args.timeout, result_dir) for job in agent_jobs]
+        for future in as_completed(futures):
+            rows.append(future.result())
 
-    cmux_monitor_surface = ""
-    if not args.no_cmux_monitor:
-        cmux_monitor_surface = open_cmux_tmux_monitor(session_name)
-
-    ready_indexes = []
-    for idx, (label, _) in enumerate(agents):
-        title = f"fusion-{label}-{run_id}"
-        if wait_for_ready(session_name, idx, title, min(120, args.timeout)):
-            ready_indexes.append(idx)
-
-    for idx in ready_indexes:
-        send_prompt(session_name, idx, topic)
-
-    rows = collect_by_title(run_id, agents, args.timeout, session_name, topic, fork_session_ids=fork_session_ids)
     expected = {f"fusion-{label}-{run_id}" for label, _ in agents}
     completed = completed_titles(rows)
-    if completed != expected:
-        existing = completed_titles(rows)
-        idle_titles = set()
-        for idx, (label, _) in enumerate(agents):
-            title = f"fusion-{label}-{run_id}"
-            if pane_is_idle(session_name, idx, title):
-                idle_titles.add(title)
-        for row in collect_from_fork_transcripts(
-            fork_session_ids,
-            agents,
-            topic,
-            expected - existing,
-            idle_titles=idle_titles,
-        ):
-            rows = replace_row_by_title(rows, row)
-            existing.add(row[2].get("session_title"))
-        for row in collect_from_panes(session_name, agents, topic, expected - existing):
-            rows = replace_row_by_title(rows, row)
-            existing.add(row[2].get("session_title"))
-        completed = completed_titles(rows)
     missing = expected - completed
     capture_complete = expected <= completed
 
-    for idx, (label, _) in enumerate(agents):
-        title = f"fusion-{label}-{run_id}"
-        if title in missing:
-            tmux("send-keys", "-t", f"{session_name}:{idx}", "C-c", check=False)
-
     judge_prompt = build_judge_prompt(topic, run_id, rows)
     (result_dir / "judge-prompt.md").write_text(judge_prompt, encoding="utf-8")
-    cleaned_tmux_session, tmux_retained_reason = cleanup_tmux_session(
-        session_name,
-        args.keep_session,
-        capture_complete,
-    )
 
     (result_dir / "manifest.json").write_text(json.dumps({
         "run_id": run_id,
-        "tmux_session": session_name,
-        "tmux_session_cleaned": cleaned_tmux_session,
-        "tmux_session_retained_reason": tmux_retained_reason,
+        "execution_mode": "headless-print",
         "topic": topic,
         "expected_titles": sorted(expected),
         "captured_titles": sorted(completed),
@@ -1066,18 +817,22 @@ def main():
         "source_session_prompt": compact(invocation_info.get("source_prompt", ""), 1200),
         "history_latest_prompt": compact(invocation_info.get("history_prompt", ""), 1200),
         "fork_session_ids": fork_session_ids,
-        "cmux_monitor_surface": cmux_monitor_surface,
+        "agent_results": [
+            {
+                "session_id": sid,
+                "summary_path": str(path),
+                "session_title": summary.get("session_title"),
+                "complete": summary_is_complete(summary),
+                "error": summary.get("error") or "",
+                "duration_ms": summary.get("duration_ms"),
+            }
+            for sid, path, summary in rows
+        ],
         "judge_prompt": str(result_dir / "judge-prompt.md"),
     }, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
     print(f"FUSION_RUN_ID={run_id}")
-    print(f"TMUX_SESSION={session_name}")
-    if cmux_monitor_surface:
-        print(f"CMUX_MONITOR_SURFACE={cmux_monitor_surface}")
-    if cleaned_tmux_session:
-        print("TMUX_SESSION_CLEANED=1")
-    if tmux_retained_reason:
-        print(f"TMUX_SESSION_RETAINED={tmux_retained_reason}")
+    print("EXECUTION_MODE=headless-print")
     print(f"FORK_MODE={fork_mode}")
     print(f"CAPTURED={len(completed)}/{len(expected)}")
     if missing:

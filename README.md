@@ -15,12 +15,12 @@ Claude Code 用の `/fusion` スラッシュコマンドです。
 1. 現在の Claude Code セッションを Claude Agent SDK で3つ fork（デフォルト: Claude / Codex / GLM）
 2. 直接 `/fusion <prompt>` から起動された場合だけ、子 fork は `/fusion` の1ターン前へ rollback
 3. 子 fork に slash command を無効化した状態で `<prompt>` だけを入力
-4. 各モデルが独立に回答し、hook と JSONL fallback で回答を収集
+4. 各モデルを headless print mode で並列実行し、stream-json から回答を収集
 5. メインセッションが全回答を読み、統合された最終回答を出力
 
 ユーザーに見えるのは最終回答だけです。複数モデルの視点を経ることで、単一モデルの盲点を補います。
 
-**注意**: このハーネスは Claude Code 専用です。fork は `@anthropic-ai/claude-agent-sdk` の `forkSession` と Claude Code の hook / JSONL 履歴に依存しており、他の AI クライアントでは動作しません。
+**注意**: このハーネスは Claude Code 専用です。fork は `@anthropic-ai/claude-agent-sdk` の `forkSession` と Claude Code の JSONL 履歴に依存しており、他の AI クライアントでは動作しません。
 
 ## rollback の仕様
 
@@ -56,7 +56,7 @@ skill や親エージェント経由で `/fusion` が呼ばれた場合は rollb
 ]
 ```
 
-- `name` — tmux のウィンドウ名・結果ラベルに使われる
+- `name` — 結果ラベルと child session 名に使われる
 - `command` — 実行されるコマンド名（Claude Code 互換の CLI であること）
 
 例: Claude 2つ + GPT 1つにする場合:
@@ -76,7 +76,7 @@ skill や親エージェント経由で `/fusion` が呼ばれた場合は rollb
 - macOS または Linux
 - Claude Code
 - Node.js / npm
-- `tmux`, `python3`, `jq`, `sqlite3`, `lsof`
+- `python3`, `jq`, `sqlite3`, `lsof`
 - `~/.local/bin` が `PATH` に入っていること
 - **[ccswitch-claude-codex-setup](https://github.com/yukimaru77/ccswitch-claude-codex-setup)** を先にセットアップしてください
   - `claude-codex` / `claude-glm` 等のマルチプロバイダーコマンドはこのリポジトリで構築します
@@ -111,24 +111,9 @@ Claude Code のセッション内で:
 /fusion 設計についてどう思う？
 ```
 
-実行中は tmux セッション `fusion-<run_id>` が作られます。デフォルトでは `claude` / `codex` / `glm` が tmux window として並びます。全エージェントの回答を回収できた場合、tmux セッションは自動削除されます。回答を取りこぼした場合だけ、調査用に tmux セッションを残します。各 run と child session id は毎回新しく生成されるため、残った tmux セッションが次回の `/fusion` に再利用されることはありません。
+実行中は `claude` / `codex` / `glm` が裏側で headless に並列実行されます。tmux や cmux の pane は作りません。各 run と child session id は毎回新しく生成されるため、前回の `/fusion` の続きから始まることはありません。
 
 `/fusion` の収集 timeout はデフォルト120分です。長いコードレビューや全ファイル精査でも途中回答を拾って終わらないよう、slash command 側も Bash tool timeout を120分に設定します。
-
-```text
-Ctrl-b n    次の window
-Ctrl-b p    前の window
-Ctrl-b 0    claude
-Ctrl-b 1    codex
-Ctrl-b 2    glm
-Ctrl-b w    window 一覧
-```
-
-今すぐ消したい場合は手動で閉じます。
-
-```bash
-tmux kill-session -t fusion-<run_id>
-```
 
 ## 動作確認
 
