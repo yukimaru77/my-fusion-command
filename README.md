@@ -46,6 +46,8 @@ skill や親エージェント経由で `/fusion` が呼ばれた場合は rollb
 
 各子 fork の Claude session 履歴は、回答を回収したあと Claude Agent SDK の `deleteSession()` で自動削除します。`~/.claude/projects/**/*.jsonl` や `~/.claude/tasks/<session-id>` に fusion の子セッションが増え続けないようにするためです。デバッグで履歴を残したい場合だけ、直接実行時に `--keep-child-sessions` を指定してください。
 
+各 agent がエラーで未完了になった場合は、デフォルトで追加2回まで失敗した agent だけを順番にリトライします。`claude` のログイン失敗は CC Switch proxy 経由で再試行します。timeout は長時間停止の再発を避けるため自動リトライしません。直接実行時は `--retries N` で追加試行回数を変えられます。
+
 過去runの子セッションを後から消す場合:
 
 ```bash

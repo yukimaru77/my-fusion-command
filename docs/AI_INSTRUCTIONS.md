@@ -195,7 +195,7 @@ sqlite3 ~/.cc-switch/cc-switch.db \
 - `/fusion` は `claude` / `claude-codex` / `claude-glm` を `-p --output-format stream-json --verbose` で headless 並列起動する。TUI 側の `--fork-session` / `--resume-session-at` には依存しない。
 - `/fusion` の収集 timeout は `fusion-run.py` 側のデフォルトで120分。slash command から `--timeout` は渡さない。`fusion/commands/fusion.md` 側では Bash tool timeout だけを120分以上に指定し、`fusion-run.py "$ARGUMENTS"` を呼ぶ。
 - run id と child session id は毎回新規生成する。base session がない場合も `--session-id` を明示し、前回の `/fusion` child session を次回に再利用しない。
-- headless の official `claude` が `Not logged in` / `authentication_failed` で失敗した場合だけ、他 agent 完了後に CC Switch proxy env (`ANTHROPIC_BASE_URL=http://127.0.0.1:15721`, `ANTHROPIC_API_KEY=PROXY_MANAGED`) で `claude` を再試行する。proxy を使う codex との current provider 競合を避けるため、fallback は初回並列実行後に単独で実行する。
+- headless agent が error で未完了になった場合は、失敗した agent だけを順番に追加リトライする。デフォルトは `--retries 2`。timeout は自動リトライしない。headless の official `claude` が `Not logged in` / `authentication_failed` で失敗した場合は CC Switch proxy env (`ANTHROPIC_BASE_URL=http://127.0.0.1:15721`, `ANTHROPIC_API_KEY=PROXY_MANAGED`) で `claude` を再試行する。proxy を使う codex との current provider 競合を避けるため、fallback は初回並列実行後に単独で実行する。
 - 子 fork は fusion-filtered `CLAUDE_CONFIG_DIR` と `--append-system-prompt` 付きで起動する。direct `/fusion` では `/fusion` 自体が履歴に残らない状態で prompt だけを送る。
 - `CLAUDE_FUSION_CHILD=1` の通常実行は拒否する。`--status` と `--cleanup-sessions` は監視・掃除用として子環境でも許可する。
 - fork の対応付けは prompt 内タグではなく `--name fusion-<agent>-<run_id>` と child session id で行う。

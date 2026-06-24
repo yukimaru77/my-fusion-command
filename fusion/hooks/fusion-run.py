@@ -863,6 +863,14 @@ def auth_error_needs_proxy_retry(label, summary):
     return "not logged in" in error or "authentication_failed" in error
 
 
+def agent_needs_retry(summary):
+    if summary_is_complete(summary):
+        return False
+    if summary.get("timed_out"):
+        return False
+    return True
+
+
 def proxy_retry_env():
     return {
         "ANTHROPIC_BASE_URL": "http://127.0.0.1:15721",
@@ -1428,6 +1436,7 @@ def main():
     )
     parser.add_argument("--workdir", default=WORKDIR_DEFAULT)
     parser.add_argument("--timeout", type=int, default=7200)
+    parser.add_argument("--retries", type=int, default=2, help="Additional retry attempts for failed non-timeout agents")
     parser.add_argument("--keep-child-sessions", action="store_true", help="Keep forked Claude child sessions in ~/.claude/projects for debugging")
     parser.add_argument("--status", nargs="?", const="latest", help="Show the latest or specified fusion run status and exit")
     parser.add_argument("--cleanup-sessions", nargs="?", const="latest", help="Delete child Claude sessions for the latest or specified fusion run and exit")
@@ -1566,43 +1575,58 @@ def main():
             update_manifest("running", rows)
 
     by_title = {summary.get("session_title"): (sid, path, summary) for sid, path, summary in rows}
-    for label, _cmd in agents:
-        title = f"fusion-{label}-{run_id}"
-        row = by_title.get(title)
-        if row is None or not auth_error_needs_proxy_retry(label, row[2]):
-            continue
-        if args.base_session:
-            retry_session, retry_args = fork_launch_args(
-                args.base_session,
-                args.workdir,
-                rollback_forks,
-                invocation_info.get("latest_prompt", ""),
+    retry_attempts = {}
+    proxy_retry_labels = set()
+    max_retries = max(0, args.retries)
+    for _ in range(max_retries):
+        attempted = False
+        for label, _cmd in agents:
+            title = f"fusion-{label}-{run_id}"
+            row = by_title.get(title)
+            summary = row[2] if row is not None else {}
+            if not agent_needs_retry(summary):
+                continue
+            attempt = retry_attempts.get(label, 0) + 1
+            retry_attempts[label] = attempt
+            if auth_error_needs_proxy_retry(label, summary):
+                proxy_retry_labels.add(label)
+            use_proxy = label in proxy_retry_labels
+            if args.base_session:
+                retry_session, retry_args = fork_launch_args(
+                    args.base_session,
+                    args.workdir,
+                    rollback_forks,
+                    invocation_info.get("latest_prompt", ""),
+                    title,
+                )
+            else:
+                retry_session, retry_args = new_session_launch_args()
+            fork_session_ids[label] = retry_session
+            child_session_ids.append(retry_session)
+            child_session_cleanup["session_ids"] = unique_values(child_session_ids)
+            fallback = "proxy-auth-retry" if use_proxy else f"retry-{attempt}"
+            retried_labels.append(f"{label}:{fallback}")
+            update_manifest(f"retrying-{label}-{attempt}", list(by_title.values()))
+            retry_job = make_headless_job(
+                label,
+                agent_commands[label],
                 title,
+                topic,
+                args.workdir,
+                retry_session,
+                retry_args,
+                system_prompt,
+                env={**child_env, **proxy_retry_env()} if use_proxy else child_env,
+                env_unset=["ANTHROPIC_AUTH_TOKEN"] if use_proxy else None,
+                extra_args=["--model", "opus"] if use_proxy else None,
+                fallback=fallback,
             )
-        else:
-            retry_session, retry_args = new_session_launch_args()
-        fork_session_ids[label] = retry_session
-        child_session_ids.append(retry_session)
-        child_session_cleanup["session_ids"] = unique_values(child_session_ids)
-        retried_labels.append(label)
-        update_manifest(f"retrying-{label}", list(by_title.values()))
-        retry_job = make_headless_job(
-            label,
-            agent_commands[label],
-            title,
-            topic,
-            args.workdir,
-            retry_session,
-            retry_args,
-            system_prompt,
-            env={**child_env, **proxy_retry_env()},
-            env_unset=["ANTHROPIC_AUTH_TOKEN"],
-            extra_args=["--model", "opus"],
-            fallback="proxy-auth-retry",
-        )
-        retry_row = run_headless_agent(retry_job, args.timeout, result_dir)
-        by_title[title] = retry_row
-        update_manifest("running", list(by_title.values()))
+            retry_row = run_headless_agent(retry_job, args.timeout, result_dir)
+            by_title[title] = retry_row
+            update_manifest("running", list(by_title.values()))
+            attempted = True
+        if not attempted:
+            break
     rows = list(by_title.values())
 
     expected = {f"fusion-{label}-{run_id}" for label, _ in agents}
