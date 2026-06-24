@@ -876,7 +876,7 @@ def main():
         help="Session id to fork. If omitted, starts agents without resumed history.",
     )
     parser.add_argument("--workdir", default=WORKDIR_DEFAULT)
-    parser.add_argument("--timeout", type=int, default=240)
+    parser.add_argument("--timeout", type=int, default=7200)
     parser.add_argument("--keep-session", action="store_true", help="Keep the tmux fusion session after collection for debugging.")
     parser.add_argument("--no-cmux-monitor", action="store_true", help="Do not open a cmux pane attached to the fusion tmux session.")
     args = parser.parse_args()

@@ -113,6 +113,8 @@ Claude Code のセッション内で:
 
 実行中は tmux セッション `fusion-<run_id>` が作られます。デフォルトでは `claude` / `codex` / `glm` が tmux window として並びます。
 
+`/fusion` の収集 timeout はデフォルト120分です。長いコードレビューや全ファイル精査でも途中回答を拾って終わらないよう、slash command 側も Bash tool timeout を120分に設定します。
+
 ```text
 Ctrl-b n    次の window
 Ctrl-b p    前の window
