@@ -7,6 +7,7 @@ import signal
 import shlex
 import shutil
 import subprocess
+import sys
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -1061,6 +1062,39 @@ def running_fusion_processes(run_id):
     return found
 
 
+def running_fusion_workers(run_id):
+    result = run(["ps", "-axo", "pid=,etime=,command="], check=False)
+    if result.returncode != 0:
+        return []
+    found = []
+    current_pid = os.getpid()
+    for line in result.stdout.splitlines():
+        parts = line.strip().split(None, 2)
+        if len(parts) < 3:
+            continue
+        try:
+            pid = int(parts[0])
+        except ValueError:
+            continue
+        if pid == current_pid:
+            continue
+        command = parts[2]
+        if "fusion-run.py" not in command or "--run-id" not in command:
+            continue
+        if not re.search(r"(?:^|\s)--run-id(?:=|\s+)" + re.escape(run_id) + r"\b", command):
+            continue
+        if "--status" in command or "--cleanup-sessions" in command:
+            continue
+        found.append({"pid": pid, "elapsed": parts[1]})
+    return found
+
+
+def phase_looks_active(phase):
+    if not phase:
+        return False
+    return phase in {"initializing", "forking", "running", "starting-worker"} or phase.startswith("retrying-")
+
+
 def format_duration(duration_ms):
     if duration_ms is None:
         return "-"
@@ -1082,12 +1116,21 @@ def one_line(text, limit=240):
     return compact(value, limit)
 
 
-def format_status_text(run_dir, manifest, summaries, running):
+def format_status_text(run_dir, manifest, summaries, running, workers=None):
     run_id = manifest.get("run_id") or run_id_from_dir(run_dir)
     expected = set(manifest.get("expected_titles") or [])
     captured = set(manifest.get("captured_titles") or [])
     running_titles = set(running.keys())
-    state = "running" if running_titles else ("complete" if manifest.get("complete") else "incomplete")
+    workers = workers or []
+    phase = manifest.get("status") or ""
+    if running_titles or workers:
+        state = "running"
+    elif manifest.get("complete"):
+        state = "complete"
+    elif phase_looks_active(phase):
+        state = "interrupted"
+    else:
+        state = "incomplete"
     agent_rows = {}
 
     for item in manifest.get("agent_results") or []:
@@ -1148,10 +1191,15 @@ def format_status_text(run_dir, manifest, summaries, running):
         "Fusion status",
         f"run_id: {run_id}",
         f"state: {state}",
-        f"phase: {manifest.get('status') or '-'}",
+        f"phase: {phase or '-'}",
         f"captured: {len(captured)}/{len(expected) if expected else len(agent_rows)}",
         f"result_dir: {run_dir}",
     ]
+    if workers:
+        worker_text = ", ".join(f"pid={item['pid']} elapsed={item['elapsed']}" for item in workers)
+        lines.append(f"worker: running {worker_text}")
+    if state == "interrupted":
+        lines.append("warning: no fusion worker or child agent is running, but the manifest was left in an active phase. The Bash tool may have timed out or the run may have been interrupted.")
     if manifest.get("updated_at"):
         lines.append(f"updated_at: {manifest.get('updated_at')}")
     if manifest.get("workdir"):
@@ -1222,6 +1270,8 @@ def format_status_text(run_dir, manifest, summaries, running):
             agent_state = "complete"
         elif error:
             agent_state = "failed"
+        elif state == "interrupted":
+            agent_state = "interrupted"
         else:
             agent_state = "pending"
         suffix = []
@@ -1262,11 +1312,13 @@ def status_payload(run_dir):
     manifest.setdefault("result_dir", str(run_dir))
     summaries = load_run_summaries(run_dir)
     running = running_fusion_processes(run_id)
+    workers = running_fusion_workers(run_id)
     return {
         "run_dir": str(run_dir),
         "manifest": manifest,
         "summaries": summaries,
         "running_processes": running,
+        "running_workers": workers,
     }
 
 
@@ -1281,6 +1333,7 @@ def show_status(spec, output_json=False):
             payload["manifest"],
             payload["summaries"],
             payload["running_processes"],
+            payload["running_workers"],
         ))
     return 0
 
@@ -1424,6 +1477,85 @@ def build_child_system_prompt(rollback_performed):
     )
 
 
+def supervise_worker(args, topic):
+    run_id = unique_run_id()
+    result_dir = CAPTURE_ROOT / f"fusion-run-{run_id}"
+    result_dir.mkdir(parents=True, exist_ok=True)
+    CAPTURE_ROOT.mkdir(parents=True, exist_ok=True)
+    log_path = result_dir / "worker.log"
+    agents = parse_agents(args.agents)
+    if args.n is not None:
+        agents = agents[:args.n]
+    started_at = now_iso()
+    write_json_file(result_dir / "manifest.json", {
+        "run_id": run_id,
+        "status": "starting-worker",
+        "started_at": started_at,
+        "updated_at": started_at,
+        "execution_mode": "headless-supervised",
+        "result_dir": str(result_dir),
+        "workdir": str(Path(args.workdir).resolve()),
+        "topic": topic,
+        "expected_titles": sorted(f"fusion-{label}-{run_id}" for label, _cmd in agents),
+        "captured_titles": [],
+        "incomplete_titles": sorted(f"fusion-{label}-{run_id}" for label, _cmd in agents),
+        "complete": False,
+        "fork_mode": "starting-worker",
+        "rollback_performed": False,
+        "fork_session_ids": {},
+        "retried_labels": [],
+        "child_session_cleanup": {
+            "enabled": not args.keep_child_sessions,
+            "session_ids": [],
+            "results": [],
+            "kept_reason": "requested by --keep-child-sessions" if args.keep_child_sessions else "",
+        },
+        "agent_results": [],
+        "judge_prompt": str(result_dir / "judge-prompt.md"),
+        "worker_log": str(log_path),
+    })
+
+    worker_argv = [
+        sys.executable,
+        str(Path(__file__).resolve()),
+        "--run-id", run_id,
+        "--workdir", args.workdir,
+        "--retries", str(args.retries),
+    ]
+    if args.n is not None:
+        worker_argv.extend(["--n", str(args.n)])
+    if args.agents:
+        worker_argv.extend(["--agents", args.agents])
+    if args.base_session:
+        worker_argv.extend(["--base-session", args.base_session])
+    if args.keep_child_sessions:
+        worker_argv.append("--keep-child-sessions")
+    worker_argv.append(topic)
+
+    env = process_base_env()
+    env["CLAUDE_FUSION_SUPERVISED_WORKER"] = "1"
+    with log_path.open("w", encoding="utf-8") as log_file:
+        proc = subprocess.Popen(
+            worker_argv,
+            cwd=args.workdir,
+            stdin=subprocess.DEVNULL,
+            stdout=log_file,
+            stderr=subprocess.STDOUT,
+            text=True,
+            env=env,
+            start_new_session=True,
+        )
+
+    print(f"FUSION_RUN_ID={run_id}", flush=True)
+    print("EXECUTION_MODE=headless-supervised", flush=True)
+    print(f"WORKER_PID={proc.pid}", flush=True)
+    print(f"STATUS_COMMAND={Path(__file__).resolve()} --status {run_id}", flush=True)
+    print(f"RESULT_DIR={result_dir}", flush=True)
+    print(f"WORKER_LOG={log_path}", flush=True)
+    print("Fusion worker started in the background. Use STATUS_COMMAND to monitor it.", flush=True)
+    return 0
+
+
 def main():
     parser = argparse.ArgumentParser(description="Run fusion: fork multiple Claude sessions headlessly and build a judge prompt.")
     parser.add_argument("topic", nargs="*", help="Topic/prompt to send to all forked sessions")
@@ -1435,8 +1567,10 @@ def main():
         help="Session id to fork. If omitted, starts agents without resumed history.",
     )
     parser.add_argument("--workdir", default=WORKDIR_DEFAULT)
-    parser.add_argument("--timeout", type=int, default=7200)
+    parser.add_argument("--timeout", type=int, default=7200, help=argparse.SUPPRESS)
     parser.add_argument("--retries", type=int, default=2, help="Additional retry attempts for failed non-timeout agents")
+    parser.add_argument("--supervise", action="store_true", help="Run the real fusion worker in a detached process and monitor it")
+    parser.add_argument("--run-id", default=None, help=argparse.SUPPRESS)
     parser.add_argument("--keep-child-sessions", action="store_true", help="Keep forked Claude child sessions in ~/.claude/projects for debugging")
     parser.add_argument("--status", nargs="?", const="latest", help="Show the latest or specified fusion run status and exit")
     parser.add_argument("--cleanup-sessions", nargs="?", const="latest", help="Delete child Claude sessions for the latest or specified fusion run and exit")
@@ -1453,12 +1587,14 @@ def main():
     if not topic:
         print("Usage: /fusion <プロンプト>", file=os.sys.stderr)
         return 2
+    if args.supervise:
+        return supervise_worker(args, topic)
 
     agents = parse_agents(args.agents)
     if args.n is not None:
         agents = agents[:args.n]
 
-    run_id = unique_run_id()
+    run_id = args.run_id or unique_run_id()
     result_dir = CAPTURE_ROOT / f"fusion-run-{run_id}"
     result_dir.mkdir(parents=True, exist_ok=True)
     CAPTURE_ROOT.mkdir(parents=True, exist_ok=True)

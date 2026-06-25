@@ -15,8 +15,8 @@ Claude Code 用の `/fusion` スラッシュコマンドです。
 1. 現在の Claude Code セッションを Claude Agent SDK で3つ fork（デフォルト: Claude / Codex / GLM）
 2. 直接 `/fusion <prompt>` から起動された場合だけ、子 fork は `/fusion` の1ターン前へ rollback
 3. 子 fork に slash command を無効化した状態で `<prompt>` だけを入力
-4. 各モデルを headless print mode で並列実行し、stream-json から回答を収集
-5. メインセッションが全回答を読み、統合された最終回答を出力
+4. supervisor が短時間で worker を裏に起動し、各モデルを headless print mode で並列実行して stream-json から回答を収集
+5. status で完了を確認し、メインセッションが全回答を読み、統合された最終回答を出力
 
 ユーザーに見えるのは最終回答だけです。複数モデルの視点を経ることで、単一モデルの盲点を補います。
 
@@ -125,7 +125,7 @@ Claude Code のセッション内で:
 
 実行中は `claude` / `codex` / `glm` が裏側で headless に並列実行されます。tmux や cmux の pane は作りません。各 run と child session id は毎回新しく生成されるため、前回の `/fusion` の続きから始まることはありません。headless の official `claude` が OAuth/keychain を拾えず認証失敗した場合は、他 agent の完了後に CC Switch proxy 経由で `claude` だけ再試行します。
 
-`/fusion` の内部収集 timeout はデフォルト120分です。slash command から `--timeout` を指定する必要はありません。長いコードレビューや全ファイル精査でも途中回答を拾って終わらないよう、Claude Code の Bash tool timeout だけは120分に設定します。
+`/fusion` はユーザーに timeout 指定を求めません。slash command は短時間で worker を起動して `FUSION_RUN_ID` と `STATUS_COMMAND` を返し、長いコードレビューや全ファイル精査は worker が裏で継続します。
 
 ## デバッグ/状態確認
 
