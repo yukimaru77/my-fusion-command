@@ -3,6 +3,7 @@ import argparse
 import json
 import os
 import re
+import selectors
 import signal
 import shlex
 import shutil
@@ -29,12 +30,18 @@ BUILTIN_AGENTS = [
 ]
 
 
+def agent_label(value):
+    base = Path(str(value)).name if "/" in str(value) else str(value)
+    base = base.replace("claude-", "")
+    return re.sub(r"[^A-Za-z0-9_.-]+", "-", base).strip("-") or "agent"
+
+
 def load_agents_config():
     if FUSION_CONFIG.exists():
         try:
             entries = json.loads(FUSION_CONFIG.read_text())
             if isinstance(entries, list) and entries:
-                return [(e["name"], e["command"]) for e in entries]
+                return [(agent_label(e["name"]), e["command"]) for e in entries]
         except Exception:
             pass
     return BUILTIN_AGENTS
@@ -108,7 +115,7 @@ def parse_agents(value):
         if not name:
             continue
         cmd = mapping.get(name, name)
-        label = name.replace("claude-", "")
+        label = agent_label(name)
         agents.append((label, cmd))
     return agents or DEFAULT_AGENTS
 
@@ -254,8 +261,12 @@ def prepare_child_claude_config(result_dir):
     return {
         "source_config_dir": str(source),
         "child_config_dir": str(target),
-        "fusion_command_disabled": True,
-        "fusion_skills_disabled": True,
+        "applied": False,
+        "runtime_guard_enabled": True,
+        "fusion_command_disabled": False,
+        "fusion_skills_disabled": False,
+        "prepared_excluded_commands": excluded_commands,
+        "prepared_excluded_skills": excluded_skills,
         "excluded_commands": excluded_commands,
         "excluded_skills": excluded_skills,
     }
@@ -399,6 +410,79 @@ def human_prompt_text(row):
         elif block.get("type") in {"image", "document"}:
             parts.append(f"[{block.get('type')}]")
     return "\n".join(parts)
+
+
+def message_content_blocks(row):
+    message = row.get("message")
+    if not isinstance(message, dict):
+        return []
+    content = message.get("content")
+    if isinstance(content, list):
+        return [block for block in content if isinstance(block, dict)]
+    return []
+
+
+def row_text_content(row):
+    message = row.get("message")
+    if not isinstance(message, dict):
+        return ""
+    content = message.get("content")
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return ""
+    parts = []
+    for block in content:
+        if isinstance(block, dict) and block.get("type") == "text" and isinstance(block.get("text"), str):
+            parts.append(block["text"])
+    return "\n".join(parts)
+
+
+def is_fusion_skill_invocation(row):
+    if row.get("type") != "assistant":
+        return False
+    for block in message_content_blocks(row):
+        if block.get("type") != "tool_use" or block.get("name") != "Skill":
+            continue
+        tool_input = block.get("input")
+        if isinstance(tool_input, dict) and str(tool_input.get("skill") or "").strip().lstrip("/") == "fusion":
+            return True
+    return False
+
+
+def is_fusion_harness_bash_invocation(row):
+    if row.get("type") != "assistant":
+        return False
+    for block in message_content_blocks(row):
+        if block.get("type") != "tool_use" or block.get("name") != "Bash":
+            continue
+        tool_input = block.get("input")
+        if not isinstance(tool_input, dict):
+            continue
+        command = tool_input.get("command")
+        if isinstance(command, str) and "fusion-run.py" in command:
+            return True
+    return False
+
+
+def is_fusion_skill_instruction_row(row):
+    if row.get("type") != "user":
+        return False
+    text = row_text_content(row)
+    return "Run the fusion harness for this topic" in text and "fusion-run.py" in text
+
+
+def is_fusion_goal_row(row):
+    if row.get("type") != "user":
+        return False
+    text = row_text_content(row)
+    if "/fusion" not in text and "fusion" not in text.lower():
+        return False
+    return (
+        "<command-name>/goal</command-name>" in text
+        or text.startswith("<local-command-stdout>Goal set:")
+        or text.startswith("A session-scoped Stop hook is now active")
+    )
 
 
 def build_uuid_index(project_dir, source):
@@ -546,14 +630,85 @@ def fusion_invocation_info(base_session, workdir):
     source_prompt = command_prompt_text(latest_human_prompt_text(source_rows, chain, sid, by_uuid))
     history_prompt = command_prompt_text(latest_history_prompt(sid, workdir))
     prompt = history_prompt if is_direct_fusion_prompt(history_prompt) else source_prompt
+    rollback_row, rollback_reason = fusion_rollback_row(chain)
+    direct_fusion = is_direct_fusion_prompt(prompt)
     return {
         "source_session": sid,
         "source_path": str(source),
         "latest_prompt": prompt,
         "source_prompt": source_prompt,
         "history_prompt": history_prompt,
-        "direct_fusion": is_direct_fusion_prompt(prompt),
+        "direct_fusion": direct_fusion,
+        "rollback_required": direct_fusion or rollback_row is not None,
+        "rollback_reason": "direct-fusion-prompt" if direct_fusion else rollback_reason,
+        "rollback_row_uuid": rollback_row.get("uuid") if rollback_row is not None else "",
     }
+
+
+def fusion_rollback_row(chain_backwards):
+    chronological = list(reversed(chain_backwards))
+    markers = []
+    for index, row in enumerate(chronological):
+        if is_fusion_skill_invocation(row):
+            markers.append((index, "skill-invocation"))
+        elif is_fusion_skill_instruction_row(row):
+            markers.append((index, "skill-instructions"))
+        elif is_fusion_harness_bash_invocation(row):
+            markers.append((index, "harness-bash"))
+    if not markers:
+        return None, ""
+
+    latest_index, latest_reason = markers[-1]
+    for index in range(latest_index, -1, -1):
+        row = chronological[index]
+        if is_fusion_skill_invocation(row):
+            assistant_start = chronological.index(first_row_of_assistant_turn(chronological, index))
+            goal_start = rollback_goal_block_start(chronological, assistant_start)
+            if goal_start is not None:
+                return chronological[goal_start], "goal-skill-invocation"
+            return chronological[assistant_start], "skill-invocation"
+        if matching_direct_fusion_row_text(row):
+            return row, "direct-fusion-row"
+    row = chronological[latest_index]
+    if row.get("type") == "assistant":
+        row = first_row_of_assistant_turn(chronological, latest_index)
+    return row, latest_reason
+
+
+def assistant_turn_key(row):
+    if row.get("type") != "assistant":
+        return ""
+    message = row.get("message")
+    message_id = message.get("id") if isinstance(message, dict) else ""
+    if isinstance(message_id, str) and message_id:
+        return f"message:{message_id}"
+    request_id = row.get("requestId")
+    if isinstance(request_id, str) and request_id:
+        return f"request:{request_id}"
+    return ""
+
+
+def first_row_of_assistant_turn(chronological_rows, index):
+    row = chronological_rows[index]
+    key = assistant_turn_key(row)
+    if not key:
+        return row
+    first = index
+    while first > 0 and assistant_turn_key(chronological_rows[first - 1]) == key:
+        first -= 1
+    return chronological_rows[first]
+
+
+def rollback_goal_block_start(chronological_rows, before_index):
+    first_goal = None
+    for index in range(before_index - 1, -1, -1):
+        row = chronological_rows[index]
+        if is_fusion_goal_row(row):
+            first_goal = index
+            continue
+        if first_goal is not None:
+            break
+    return first_goal
 
 
 def target_assistant(chain_backwards, turns=1):
@@ -651,6 +806,21 @@ def checkpoint_before_row(row, by_uuid):
     raise RuntimeError("no checkpoint exists before the fusion command")
 
 
+def checkpoint_has_conversation(checkpoint, by_uuid):
+    current = checkpoint
+    seen = set()
+    while current is not None:
+        current_uuid = current.get("uuid")
+        if not isinstance(current_uuid, str) or current_uuid in seen:
+            break
+        if current.get("type") in {"user", "assistant"} and isinstance(current.get("message"), dict):
+            return True
+        seen.add(current_uuid)
+        parent = current.get("parentUuid")
+        current = by_uuid.get(parent) if isinstance(parent, str) else None
+    return False
+
+
 def target_checkpoint_before_fusion(source_rows, by_uuid, chain_backwards, sid, fusion_prompt):
     command_row = latest_fusion_command_row(source_rows, sid, fusion_prompt)
     if command_row is not None:
@@ -668,15 +838,23 @@ def new_session_launch_args():
     return new_sid, ["--session-id", new_sid]
 
 
-def fork_launch_args(base_session, workdir, rollback_to_previous_turn, rollback_prompt="", fork_title="fusion fork"):
+def fork_launch_args(base_session, workdir, rollback_to_previous_turn, rollback_prompt="", fork_title="fusion fork", rollback_row_uuid=""):
     source = resolve_claude_session(base_session, workdir)
     sid = source.stem
     checkpoint_uuid = ""
     if rollback_to_previous_turn:
         by_uuid, source_rows = build_uuid_index(source.parent, source)
-        leaf = find_leaf(source_rows, by_uuid, sid)
-        chain = walk_back(leaf, by_uuid)
-        checkpoint = target_checkpoint_before_fusion(source_rows, by_uuid, chain, sid, rollback_prompt)
+        if rollback_row_uuid:
+            rollback_row = by_uuid.get(rollback_row_uuid)
+            if rollback_row is None:
+                raise RuntimeError(f"rollback row not found: {rollback_row_uuid}")
+            checkpoint = checkpoint_before_row(rollback_row, by_uuid)
+        else:
+            leaf = find_leaf(source_rows, by_uuid, sid)
+            chain = walk_back(leaf, by_uuid)
+            checkpoint = target_checkpoint_before_fusion(source_rows, by_uuid, chain, sid, rollback_prompt)
+        if not checkpoint_has_conversation(checkpoint, by_uuid):
+            return new_session_launch_args()
         checkpoint_uuid = checkpoint["uuid"]
     result = subprocess.run(
         [SDK_FORK_BIN, sid, workdir, checkpoint_uuid, fork_title],
@@ -764,11 +942,114 @@ def terminate_process_group(proc):
             proc.kill()
 
 
+def safe_artifact_token(value):
+    return re.sub(r"[^A-Za-z0-9_.-]+", "-", value or "").strip("-") or "retry"
+
+
+def preserve_existing_agent_artifacts(label, result_dir, fallback):
+    if not fallback:
+        return
+    existing = [
+        result_dir / f"{label}.stdout.jsonl",
+        result_dir / f"{label}.stderr.txt",
+        result_dir / f"{label}.summary.json",
+    ]
+    if not any(path.exists() for path in existing):
+        return
+    attempts_dir = result_dir / "attempts"
+    attempts_dir.mkdir(parents=True, exist_ok=True)
+    token = f"{label}.{safe_artifact_token(fallback)}.{int(time.time() * 1000)}"
+    for path in existing:
+        if path.exists():
+            suffix = path.name.removeprefix(f"{label}.")
+            shutil.copy2(path, attempts_dir / f"{token}.{suffix}")
+
+
+def retry_event_error(line):
+    try:
+        payload = json.loads(line)
+    except Exception:
+        return "", 0
+    if payload.get("type") != "system" or payload.get("subtype") != "api_retry":
+        return "", 0
+    status = payload.get("error_status")
+    error = str(payload.get("error") or "")
+    attempt = payload.get("attempt")
+    try:
+        attempt_number = int(attempt)
+    except Exception:
+        attempt_number = 0
+    if status in {401, 403} or "authentication" in error.lower():
+        return f"API authentication failed during provider retry: {status or ''} {error}".strip(), attempt_number
+    if status == 529 and attempt_number >= 3:
+        return f"API overloaded during provider retry: {status} {error}".strip(), attempt_number
+    return "", attempt_number
+
+
+def communicate_with_early_api_failure(proc, timeout_s):
+    stdout_parts = []
+    stderr_parts = []
+    early_error = ""
+    timed_out = False
+    selector = selectors.DefaultSelector()
+    if proc.stdout:
+        selector.register(proc.stdout, selectors.EVENT_READ, "stdout")
+    if proc.stderr:
+        selector.register(proc.stderr, selectors.EVENT_READ, "stderr")
+    deadline = time.time() + timeout_s
+    try:
+        while selector.get_map():
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                timed_out = True
+                terminate_process_group(proc)
+                break
+            for key, _ in selector.select(timeout=min(0.25, remaining)):
+                line = key.fileobj.readline()
+                if line == "":
+                    selector.unregister(key.fileobj)
+                    continue
+                if key.data == "stdout":
+                    stdout_parts.append(line)
+                    if not early_error:
+                        early_error, _attempt = retry_event_error(line)
+                        if early_error:
+                            terminate_process_group(proc)
+                else:
+                    stderr_parts.append(line)
+            if proc.poll() is not None:
+                for key in list(selector.get_map().values()):
+                    rest = key.fileobj.read()
+                    if rest:
+                        if key.data == "stdout":
+                            stdout_parts.append(rest)
+                        else:
+                            stderr_parts.append(rest)
+                    selector.unregister(key.fileobj)
+                break
+    finally:
+        selector.close()
+    if timed_out or early_error:
+        try:
+            out, err = proc.communicate(timeout=2)
+            stdout_parts.append(out or "")
+            stderr_parts.append(err or "")
+        except Exception:
+            pass
+    else:
+        try:
+            proc.wait(timeout=2)
+        except Exception:
+            terminate_process_group(proc)
+    return "".join(stdout_parts), "".join(stderr_parts), timed_out, early_error
+
+
 def run_headless_agent(agent, timeout_s, result_dir):
     label = agent["label"]
     stdout_path = result_dir / f"{label}.stdout.jsonl"
     stderr_path = result_dir / f"{label}.stderr.txt"
     summary_path = result_dir / f"{label}.summary.json"
+    preserve_existing_agent_artifacts(label, result_dir, agent.get("fallback", ""))
     started = time.time()
     timed_out = False
     stdout = ""
@@ -789,12 +1070,9 @@ def run_headless_agent(agent, timeout_s, result_dir):
             env=proc_env,
             start_new_session=True,
         )
-        try:
-            stdout, stderr = proc.communicate(timeout=timeout_s)
-        except subprocess.TimeoutExpired:
-            timed_out = True
-            terminate_process_group(proc)
-            stdout, stderr = proc.communicate()
+        stdout, stderr, timed_out, early_error = communicate_with_early_api_failure(proc, timeout_s)
+        if early_error:
+            stderr = ((stderr or "") + "\n" + early_error + "\n").lstrip()
         returncode = proc.returncode if proc.returncode is not None else -1
     except FileNotFoundError as exc:
         stderr = str(exc)
@@ -868,6 +1146,18 @@ def agent_needs_retry(summary):
     if summary_is_complete(summary):
         return False
     if summary.get("timed_out"):
+        return False
+    error = (summary.get("error") or summary.get("last_assistant") or "").lower()
+    if "not logged in" in error:
+        return True
+    non_retryable = (
+        "refresh token" in error
+        or "api error: 401" in error
+        or "unauthorized" in error
+        or "认证失败" in error
+        or "failed to authenticate" in error
+    )
+    if non_retryable:
         return False
     return True
 
@@ -993,6 +1283,8 @@ def manifest_payload(
         "complete": expected <= completed,
         "fork_mode": fork_mode,
         "rollback_performed": rollback_forks,
+        "rollback_reason": invocation_info.get("rollback_reason", ""),
+        "rollback_row_uuid": invocation_info.get("rollback_row_uuid", ""),
         "source_session": invocation_info.get("source_session", ""),
         "source_path": invocation_info.get("source_path", ""),
         "source_latest_prompt": compact(invocation_info.get("latest_prompt", ""), 1200),
@@ -1127,6 +1419,8 @@ def format_status_text(run_dir, manifest, summaries, running, workers=None):
         state = "running"
     elif manifest.get("complete"):
         state = "complete"
+    elif phase == "incomplete":
+        state = "partial" if captured else "failed"
     elif phase_looks_active(phase):
         state = "interrupted"
     else:
@@ -1211,13 +1505,17 @@ def format_status_text(run_dir, manifest, summaries, running, workers=None):
     lines.extend([
         f"fork_mode: {manifest.get('fork_mode') or '-'}",
         f"rollback_performed: {bool(manifest.get('rollback_performed'))}",
+        f"rollback_reason: {manifest.get('rollback_reason') or '-'}",
         f"retried_labels: {', '.join(manifest.get('retried_labels') or []) or '-'}",
     ])
     child_config = manifest.get("child_config") or {}
     if child_config:
         lines.append(f"child_config_dir: {child_config.get('child_config_dir') or '-'}")
-        lines.append(f"disabled_commands: {', '.join(child_config.get('excluded_commands') or []) or '-'}")
-        lines.append(f"disabled_skills: {', '.join(child_config.get('excluded_skills') or []) or '-'}")
+        lines.append(f"child_config_applied: {bool(child_config.get('applied'))}")
+        lines.append(f"runtime_guard_enabled: {bool(child_config.get('runtime_guard_enabled'))}")
+        if child_config.get("applied"):
+            lines.append(f"disabled_commands: {', '.join(child_config.get('excluded_commands') or []) or '-'}")
+            lines.append(f"disabled_skills: {', '.join(child_config.get('excluded_skills') or []) or '-'}")
     cleanup = manifest.get("child_session_cleanup") or {}
     if cleanup:
         session_ids = cleanup.get("session_ids") or []
@@ -1272,6 +1570,8 @@ def format_status_text(run_dir, manifest, summaries, running, workers=None):
             agent_state = "failed"
         elif state == "interrupted":
             agent_state = "interrupted"
+        elif state in {"failed", "partial"}:
+            agent_state = "failed"
         else:
             agent_state = "pending"
         suffix = []
@@ -1602,7 +1902,6 @@ def main():
     started_at = now_iso()
     child_config_info = prepare_child_claude_config(result_dir)
     child_env = {
-        "CLAUDE_CONFIG_DIR": child_config_info["child_config_dir"],
         "CLAUDE_FUSION_CHILD": "1",
     }
     write_json_file(manifest_path, {
@@ -1632,8 +1931,11 @@ def main():
     fork_mode = "no-base-session"
     if args.base_session:
         invocation_info = fusion_invocation_info(args.base_session, args.workdir)
-        rollback_forks = invocation_info["direct_fusion"]
-        fork_mode = "rollback-direct-fusion" if rollback_forks else "plain-fork-skill-or-nested"
+        rollback_forks = invocation_info["rollback_required"]
+        if rollback_forks:
+            fork_mode = f"rollback-{invocation_info.get('rollback_reason') or 'fusion-invocation'}"
+        else:
+            fork_mode = "plain-fork-no-fusion-marker"
 
     system_prompt = build_child_system_prompt(rollback_forks)
 
@@ -1681,6 +1983,7 @@ def main():
                 rollback_forks,
                 invocation_info.get("latest_prompt", ""),
                 title,
+                invocation_info.get("rollback_row_uuid", ""),
             )
         else:
             resume_session, fork_args = new_session_launch_args()
@@ -1734,6 +2037,7 @@ def main():
                     rollback_forks,
                     invocation_info.get("latest_prompt", ""),
                     title,
+                    invocation_info.get("rollback_row_uuid", ""),
                 )
             else:
                 retry_session, retry_args = new_session_launch_args()
